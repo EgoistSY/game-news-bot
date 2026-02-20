@@ -101,5 +101,5 @@ def send_to_slack(message):
 
 if __name__ == '__main__':
     report = create_report_message()
-    send_to_slack(report)
+    print(report) #
 
