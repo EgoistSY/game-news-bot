@@ -1,12 +1,11 @@
 # ------------------------------------------------------------------
-# [운영용 v4] FAST Google News RSS -> Slack Digest (2026-02-23)
-# 목표: 1~2분 내 완료 + 0건 확률 최소화 (Python 3.9 호환)
-#
-# 전략:
-# - googlesearch-python 제거
-# - news.google 링크 리졸브/HTML 파싱/본문 크롤링 제거 (속도↑, 안정↑)
-# - RSS 쿼리 수를 줄이기 위해 site: OR 묶음 사용
-# - 0건이면 자동으로 필터 완화 폴백 실행
+# [운영용 v4.1] FAST Google News RSS -> Slack Digest (Noise-reduced)
+# - Python 3.9 호환
+# - 핵심 개선:
+#   1) 쿼리에 게임 컨텍스트 강제 (노이즈 대폭 감소)
+#   2) zdnet/ddaily는 추가로 엄격 필터 (제목/요약에 게임 힌트 필요)
+#   3) snippet HTML 제거 (Slack에 <a href=...> 섞이는 문제 방지)
+#   4) 폴백에서도 게임 컨텍스트 유지 (은행/유통/인사 기사 방지)
 # ------------------------------------------------------------------
 import os
 import re
@@ -21,9 +20,6 @@ from urllib.parse import quote
 import requests
 import feedparser
 
-# ==========================
-# 설정
-# ==========================
 SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL")
 
 TARGET_SITES = [
@@ -43,33 +39,47 @@ PRIMARY_KEYWORDS = [
 
 SEARCH_DAYS = 14
 
-# 속도/안정 밸런스
-# - 키워드 전부를 다 때리면 RSS 호출이 늘어남
-# - 운영용에서는 상위 N개만 먼저 수집하고, 0건이면 확장 폴백
-KEYWORD_BATCH_PRIMARY = 10   # 1차: 상위 10개 키워드
-KEYWORD_BATCH_FALLBACK = 18  # 2차(0건일 때): 전체 키워드
-
-# RSS 1회 호출에서 최대 몇 개 entry까지 사용할지
+KEYWORD_BATCH_PRIMARY = 10
+KEYWORD_BATCH_FALLBACK = 18
 MAX_ENTRIES_PER_FEED = 30
 
 REQUEST_TIMEOUT = 12
-USER_AGENT = "Mozilla/5.0 (FastNewsDigestBot/1.0; SlackWebhook)"
+USER_AGENT = "Mozilla/5.0 (FastNewsDigestBot/1.1; SlackWebhook)"
 SLEEP_BETWEEN_FEEDS = (0.05, 0.15)
 
-# Slack 메시지 제한 대응
 SLACK_TEXT_LIMIT = 3500
 TITLE_MAX = 120
 SNIPPET_MAX = 180
-
-# Actions 로그 미리보기
 PREVIEW_TOP_N = 20
 
+# --------------------------
+# 게임 컨텍스트 (쿼리 조임)
+# --------------------------
+GAME_CONTEXT_OR = [
+    "게임", "게이밍", "게임업계", "게임사", "퍼블리셔", "개발사",
+    "모바일게임", "PC게임", "콘솔", "스팀", "Steam", "PS5", "플레이스테이션", "닌텐도", "Xbox",
+    "RPG", "MMORPG", "FPS", "MOBA",
+]
+GAME_CONTEXT_QUERY = "(" + " OR ".join(GAME_CONTEXT_OR) + ")"
 
-# ==========================
-# 유틸
-# ==========================
+# --------------------------
+# “게임 매체가 아닌” 사이트는 더 엄격하게
+# --------------------------
+STRICT_SITES = {"zdnet.co.kr", "ddaily.co.kr"}
+
+# 제목/요약에 이 힌트가 하나도 없으면(특히 zdnet/ddaily) 버림
+GAME_HINTS = [
+    "게임", "게이밍", "신작", "업데이트", "출시", "스팀", "콘솔", "모바일", "PC",
+    "플레이스테이션", "닌텐도", "Xbox", "RPG", "MMORPG", "FPS", "MOBA", "e스포츠", "esports",
+    "넥슨", "엔씨", "크래프톤", "넷마블", "카카오게임", "스마일게이트", "펄어비스",
+]
+
 def _clean_text(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip())
+
+def _strip_html(s: str) -> str:
+    # snippet에 <a ...> 같은 게 섞이는 문제 방지
+    return re.sub(r"<[^>]+>", "", s or "")
 
 def _truncate(s: str, n: int) -> str:
     s = s or ""
@@ -95,8 +105,8 @@ def _within_days(dt: Optional[datetime], days: int) -> bool:
         return True
     return dt >= (datetime.now() - timedelta(days=days))
 
-def _press_guess_from_source(entry) -> str:
-    # feedparser가 source/title 등을 주는 경우가 있음. 없으면 NEWS.
+def _press_guess(entry) -> str:
+    # entry.source.title이 종종 "게임메카" 등으로 들어옴
     try:
         src = getattr(entry, "source", None)
         if src and isinstance(src, dict):
@@ -108,23 +118,24 @@ def _press_guess_from_source(entry) -> str:
     return "NEWS"
 
 def _google_news_rss_search_url(query: str) -> str:
-    # Google News RSS Search
-    # hl=ko gl=KR ceid=KR:ko 고정
     return "https://news.google.com/rss/search?q=" + quote(query) + "&hl=ko&gl=KR&ceid=KR:ko"
 
 def _site_or_query(sites: List[str]) -> str:
-    # (site:a OR site:b OR site:c)
     return "(" + " OR ".join([f"site:{s}" for s in sites]) + ")"
 
-def _build_query(keyword: str, sites: List[str], days: int) -> str:
-    # keyword + (site OR ...) + when:Nd
-    # 따옴표는 결과를 급감시킬 수 있어 사용하지 않음
-    return f"{keyword} {_site_or_query(sites)} when:{days}d"
+def _build_query(keyword: str, sites: List[str], days: int, game_context: str) -> str:
+    # sites가 비어있으면 site 조건 없이(폴백) game_context + keyword만 유지
+    if sites:
+        return f"{game_context} {keyword} {_site_or_query(sites)} when:{days}d"
+    return f"{game_context} {keyword} when:{days}d"
 
+def _has_game_hint(title: str, snippet: str) -> bool:
+    blob = f"{title} {snippet}".lower()
+    for h in GAME_HINTS:
+        if h.lower() in blob:
+            return True
+    return False
 
-# ==========================
-# RSS 수집 (빠른 버전)
-# ==========================
 def fetch_fast(keywords: List[str], sites: List[str], days: int) -> Tuple[List[Dict], Dict[str, int]]:
     session = requests.Session()
     session.headers.update({
@@ -136,14 +147,14 @@ def fetch_fast(keywords: List[str], sites: List[str], days: int) -> Tuple[List[D
         "feeds_called": 0,
         "entries_seen": 0,
         "date_filtered_out": 0,
+        "strict_filtered_out": 0,
         "added": 0,
     }
 
     articles: Dict[str, Dict] = {}
 
-    # 키워드별로 RSS 한 번씩만 호출 (사이트는 OR로 묶음)
     for kw in keywords:
-        q = _build_query(kw, sites, days)
+        q = _build_query(kw, sites, days, GAME_CONTEXT_QUERY)
         url = _google_news_rss_search_url(q)
 
         try:
@@ -152,9 +163,7 @@ def fetch_fast(keywords: List[str], sites: List[str], days: int) -> Tuple[List[D
             stats["feeds_called"] += 1
 
             feed = feedparser.parse(resp.text)
-            entries = feed.entries[:MAX_ENTRIES_PER_FEED]
-
-            for e in entries:
+            for e in feed.entries[:MAX_ENTRIES_PER_FEED]:
                 stats["entries_seen"] += 1
 
                 title = _clean_text(getattr(e, "title", ""))
@@ -167,8 +176,16 @@ def fetch_fast(keywords: List[str], sites: List[str], days: int) -> Tuple[List[D
                     stats["date_filtered_out"] += 1
                     continue
 
-                # RSS에서 제공하는 summary가 있을 수 있음(짧게만 사용)
-                snippet = _clean_text(getattr(e, "summary", "") or getattr(e, "description", ""))
+                snippet_raw = getattr(e, "summary", "") or getattr(e, "description", "") or ""
+                snippet = _clean_text(_strip_html(snippet_raw))
+                snippet = _truncate(snippet, SNIPPET_MAX)
+
+                # ✅ 사이트별 엄격 필터: zdnet/ddaily는 게임 힌트가 없으면 제거
+                # (link가 news.google 중간링크여도, title/summary로 충분히 거를 수 있음)
+                if any(s in link for s in STRICT_SITES) or any(s in title for s in ("지디넷", "디지털데일리")):
+                    if not _has_game_hint(title, snippet):
+                        stats["strict_filtered_out"] += 1
+                        continue
 
                 sid = _stable_id(title, link)
                 if sid in articles:
@@ -176,12 +193,12 @@ def fetch_fast(keywords: List[str], sites: List[str], days: int) -> Tuple[List[D
 
                 articles[sid] = {
                     "keyword": kw,
-                    "press": _press_guess_from_source(e),
+                    "press": _press_guess(e),
                     "title": _truncate(title, TITLE_MAX),
                     "link": link,
                     "published_dt": published_dt,
                     "published": published_dt.strftime("%Y-%m-%d %H:%M") if published_dt else "",
-                    "snippet": _truncate(snippet, SNIPPET_MAX) if snippet else "",
+                    "snippet": snippet,
                 }
                 stats["added"] += 1
 
@@ -191,16 +208,11 @@ def fetch_fast(keywords: List[str], sites: List[str], days: int) -> Tuple[List[D
             print(f"[WARN] RSS call failed (kw={kw}): {ex}")
             continue
 
-    # 최신순 정렬
     def sort_key(x: Dict) -> datetime:
         return x["published_dt"] if x.get("published_dt") else datetime.min
 
     return sorted(list(articles.values()), key=sort_key, reverse=True), stats
 
-
-# ==========================
-# Slack 메시지 생성/전송
-# ==========================
 def _is_nexon(a: Dict) -> bool:
     blob = f"{a.get('title','')} {a.get('snippet','')} {a.get('link','')}".lower()
     return ("넥슨" in blob) or ("nexon" in blob)
@@ -208,7 +220,7 @@ def _is_nexon(a: Dict) -> bool:
 def build_messages(articles: List[Dict], stats: Dict[str, int], days: int) -> List[str]:
     today_str = datetime.now().strftime("%Y-%m-%d")
     header = f"## 📰 {today_str} 게임업계 뉴스 브리핑 (최근 {days}일)\n"
-    header += f"- 수집: feeds={stats.get('feeds_called',0)}, entries={stats.get('entries_seen',0)}, added={stats.get('added',0)}\n\n"
+    header += f"- 수집: feeds={stats.get('feeds_called',0)}, entries={stats.get('entries_seen',0)}, added={stats.get('added',0)}, strict_drop={stats.get('strict_filtered_out',0)}\n\n"
 
     def fmt(a: Dict) -> str:
         pub = f" ({a['published']})" if a.get("published") else ""
@@ -222,7 +234,7 @@ def build_messages(articles: List[Dict], stats: Dict[str, int], days: int) -> Li
     if not major:
         body += f"- 최근 {days}일 기준 뉴스가 없습니다.\n"
     else:
-        for a in major[:80]:  # 너무 많이 보내면 스팸이므로 상한
+        for a in major[:80]:
             body += fmt(a)
 
     body += "\n---\n### 🏢 넥슨 관련 주요 뉴스\n"
@@ -234,7 +246,6 @@ def build_messages(articles: List[Dict], stats: Dict[str, int], days: int) -> Li
 
     full = header + body
 
-    # Slack 길이 제한 대응: 라인 단위 분할
     messages: List[str] = []
     chunk = ""
     for line in full.splitlines(True):
@@ -260,26 +271,20 @@ def send_to_slack_text(message: str) -> None:
     )
     resp.raise_for_status()
 
-
-# ==========================
-# Main (자동 폴백)
-# ==========================
 def main() -> None:
-    # 1차 시도: 상위 키워드만 빠르게
-    primary_keywords = PRIMARY_KEYWORDS[:KEYWORD_BATCH_PRIMARY]
-    articles, stats = fetch_fast(primary_keywords, TARGET_SITES, SEARCH_DAYS)
+    # 1차: 상위 키워드로 사이트 제한 검색
+    primary = PRIMARY_KEYWORDS[:KEYWORD_BATCH_PRIMARY]
+    articles, stats = fetch_fast(primary, TARGET_SITES, SEARCH_DAYS)
 
-    # 0건이면 2차(키워드 확장)
+    # 0건이면: 키워드 확장
     if not articles:
         print("[INFO] primary fetch returned 0. fallback to full keyword set.")
         articles, stats = fetch_fast(PRIMARY_KEYWORDS[:KEYWORD_BATCH_FALLBACK], TARGET_SITES, SEARCH_DAYS)
 
-    # 그래도 0건이면 최후 폴백: 사이트 필터 제거(업계 뉴스라도 보내기)
+    # 그래도 0건이면: 최후 폴백(사이트 조건 제거) BUT 게임 컨텍스트는 유지
     if not articles:
-        print("[INFO] still 0. final fallback: remove site filters.")
-        # 키워드 10개만, when만 유지
-        session_sites: List[str] = []
-        articles, stats = fetch_fast(PRIMARY_KEYWORDS[:10], session_sites, SEARCH_DAYS)
+        print("[INFO] still 0. final fallback: remove site filters (keep game context).")
+        articles, stats = fetch_fast(PRIMARY_KEYWORDS[:10], [], SEARCH_DAYS)
 
     print(f"[INFO] fetched articles: {len(articles)}")
     print(f"[INFO] stats: {stats}")
@@ -287,7 +292,6 @@ def main() -> None:
     for i, a in enumerate(articles[:PREVIEW_TOP_N], 1):
         print(f"  {i:02d}. [{a.get('press','NEWS')}] {a.get('title','')} :: {a.get('link','')}")
 
-    # Slack 전송
     messages = build_messages(articles, stats, SEARCH_DAYS)
     for i, msg in enumerate(messages, 1):
         send_to_slack_text(msg)
