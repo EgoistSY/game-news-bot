@@ -1,6 +1,7 @@
 # ------------------------------------------------------------------
-# [최적 운영용] Google News RSS + 본문 요약 + Slack 전송(자동 분할) (2026-02-23)
-# - googlesearch-python 사용 안 함 (차단/0건 리스크 제거)
+# [운영용 최종] Google News RSS + 본문 요약 + Slack 전송(자동 분할) (2026-02-23)
+# - Python 3.9 호환 (typing.Optional 사용)
+# - googlesearch-python 사용 안 함 (차단/0건 리스크 감소)
 # - requirements.txt: requests, feedparser, beautifulsoup4, lxml, trafilatura
 # ------------------------------------------------------------------
 import os
@@ -9,6 +10,7 @@ import json
 import time
 import hashlib
 import random
+from typing import Optional, Dict, List
 from datetime import datetime, timedelta
 from urllib.parse import quote, urlparse, parse_qs, urlunparse
 
@@ -45,14 +47,14 @@ SLEEP_BETWEEN_REQUESTS = (0.2, 0.6)
 
 SUMMARY_CHARS = 320
 
-# Slack 텍스트가 너무 길면 실패/잘림 위험 → 보수적으로 분할
+# Slack 메시지가 너무 길면 실패/잘림 위험 → 보수적으로 분할
 SLACK_TEXT_LIMIT = 3500
 
 
 # ==========================
 # 유틸
 # ==========================
-def _sleep():
+def _sleep() -> None:
     time.sleep(random.uniform(*SLEEP_BETWEEN_REQUESTS))
 
 def _clean_text(s: str) -> str:
@@ -85,6 +87,7 @@ def _normalize_url(raw_url: str) -> str:
     try:
         p = urlparse(raw_url)
         qs = parse_qs(p.query)
+
         for k in list(qs.keys()):
             if k.lower().startswith("utm_"):
                 qs.pop(k, None)
@@ -107,9 +110,9 @@ def _press_from_url(url: str) -> str:
         return "NEWS"
 
 def _stable_id(title: str, link: str) -> str:
-    return hashlib.sha1(f"{title}||{link}".encode("utf-8")).hexdigest()[:16]
+    return hashlib.sha1((title + "||" + link).encode("utf-8")).hexdigest()[:16]
 
-def _parse_published(entry) -> datetime | None:
+def _parse_published(entry) -> Optional[datetime]:
     t = getattr(entry, "published_parsed", None) or getattr(entry, "updated_parsed", None)
     if not t:
         return None
@@ -118,14 +121,16 @@ def _parse_published(entry) -> datetime | None:
     except Exception:
         return None
 
-def _within_days(dt: datetime | None, days: int) -> bool:
+def _within_days(dt: Optional[datetime], days: int) -> bool:
     if not dt:
-        # 날짜가 없으면 포함(너무 엄격하면 결과가 0 될 수 있음)
+        # 날짜가 없으면 포함(너무 엄격하면 결과 0 위험)
         return True
     return dt >= (datetime.now() - timedelta(days=days))
 
 def _google_news_rss_url(keyword: str, site: str, days: int) -> str:
-    # when:Nd는 최근 N일 중심으로 결과를 안정적으로 끌어오는 편
+    """
+    when:Nd는 최근 N일 중심으로 결과를 안정적으로 끌어오는 편
+    """
     q = f'"{keyword}" site:{site} when:{days}d'
     return "https://news.google.com/rss/search?q=" + quote(q) + "&hl=ko&gl=KR&ceid=KR:ko"
 
@@ -181,11 +186,11 @@ def extract_summary(url: str, session: requests.Session) -> str:
 # ==========================
 # RSS 수집
 # ==========================
-def fetch_articles() -> list[dict]:
+def fetch_articles() -> List[Dict]:
     session = requests.Session()
     session.headers.update({"User-Agent": USER_AGENT})
 
-    articles = {}  # sid -> article
+    articles: Dict[str, Dict] = {}
 
     for kw in PRIMARY_KEYWORDS:
         for site in TARGET_SITES:
@@ -206,10 +211,8 @@ def fetch_articles() -> list[dict]:
 
                     if not title or not link:
                         continue
-                    # 안전망: 지정 도메인만
                     if site not in link:
                         continue
-                    # 날짜 안전망
                     if not _within_days(published_dt, SEARCH_DAYS):
                         continue
 
@@ -239,28 +242,28 @@ def fetch_articles() -> list[dict]:
         _sleep()
 
     # 최신순 정렬 (published_dt 없는 건 뒤로)
-    def sort_key(x: dict):
+    def sort_key(x: Dict) -> datetime:
         return x["published_dt"] if x.get("published_dt") else datetime.min
 
-    return sorted(articles.values(), key=sort_key, reverse=True)
+    return sorted(list(articles.values()), key=sort_key, reverse=True)
 
 
 # ==========================
 # Slack 메시지 생성/전송
 # ==========================
-def is_nexon(article: dict) -> bool:
+def is_nexon(article: Dict) -> bool:
     blob = f"{article.get('title','')} {article.get('summary','')} {article.get('link','')}".lower()
     return ("넥슨" in blob) or ("nexon" in blob)
 
-def build_messages(articles: list[dict]) -> list[str]:
+def build_messages(articles: List[Dict]) -> List[str]:
     today_str = datetime.now().strftime("%Y-%m-%d")
-    header = f"## 📰 {today_str} 게임업계 뉴스 브리핑 (최근 {SEARCH_DAYS}일, Google News RSS)\n"
-    header += f"- 대상 사이트: {', '.join(TARGET_SITES)}\n"
-    header += f"- 키워드: {', '.join(PRIMARY_KEYWORDS)}\n\n"
+    header = f"## 📰 {today_str} 게임업계 뉴스 브리핑 (최근 {SEARCH_DAYS}일, Google News RSS)\n\n"
 
-    def fmt(a: dict) -> str:
+    def fmt(a: Dict) -> str:
         pub = f" ({a['published']})" if a.get("published") else ""
-        summ = f"\n    - {_truncate(a.get('summary',''), 500)}" if a.get("summary") else ""
+        summ = ""
+        if a.get("summary"):
+            summ = f"\n    - {_truncate(a.get('summary',''), 500)}"
         return f"▶ *[{a['press']}]* <{a['link']}|{a['title']}>{pub}{summ}\n"
 
     major = articles
@@ -283,7 +286,7 @@ def build_messages(articles: list[dict]) -> list[str]:
     full = header + body
 
     # Slack 길이 제한 대응: 라인 단위 분할
-    messages = []
+    messages: List[str] = []
     chunk = ""
     for line in full.splitlines(True):
         if len(chunk) + len(line) > SLACK_TEXT_LIMIT:
@@ -295,7 +298,7 @@ def build_messages(articles: list[dict]) -> list[str]:
 
     return messages
 
-def send_to_slack_text(message: str):
+def send_to_slack_text(message: str) -> None:
     if not SLACK_WEBHOOK_URL:
         raise RuntimeError("환경변수 SLACK_WEBHOOK_URL이 설정되어 있지 않습니다.")
 
@@ -308,7 +311,7 @@ def send_to_slack_text(message: str):
     )
     resp.raise_for_status()
 
-def main():
+def main() -> None:
     articles = fetch_articles()
     print(f"[INFO] fetched articles: {len(articles)}")
     messages = build_messages(articles)
