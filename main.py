@@ -42,7 +42,7 @@ def get_correct_link_from_google(title):
     return None
 
 def find_all_news():
-    yesterday_morning = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=1)
+    yesterday_morning = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=3)
     
     all_important_articles = []
     nexon_specific_articles = []
