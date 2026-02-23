@@ -1,5 +1,5 @@
 # ------------------------------------------------------------------
-# [운영용 v4.4] 정확 링크 + 기사 아닌 게시물 제거 (경량)
+# [운영용 v4.4.1] 정확 링크 + 기사 아닌 게시물 제거 (경량, NameError fix)
 # - Python 3.9 호환
 # - 목표:
 #   1) Slack에 보내는 링크는 "원문 URL"만 (Google 중간 링크 제거)
@@ -45,23 +45,27 @@ PRIMARY_KEYWORDS = [
     "매출", "순위", "소송", "규제", "CBT", "OBT", "인수", "투자", "M&A"
 ]
 
+# ✅ 누락되었던 상수들 (NameError 수정)
+KEYWORD_BATCH_PRIMARY = 10
+KEYWORD_BATCH_FALLBACK = 18
+
 # 전날 범위로 고정 (KST)
 KST = ZoneInfo("Asia/Seoul")
 
 REQUEST_TIMEOUT = 10
-USER_AGENT = "Mozilla/5.0 (GameNewsBot/1.4; SlackWebhook)"
+USER_AGENT = "Mozilla/5.0 (GameNewsBot/1.41; SlackWebhook)"
 SLEEP_BETWEEN_FEEDS = (0.05, 0.12)
 
 MAX_ENTRIES_PER_FEED = 30
 MAX_ENTRIES_PER_NEXON_FEED = 20
 
-# Slack 출력 상한(너무 많으면 노이즈)
+# Slack 출력 상한
 GENERAL_SEND_LIMIT = 50
 NEXON_SEND_LIMIT = 5
 
-# 리다이렉트 해제는 "보낼 기사" + 백필용 일부만 수행 (경량)
-RESOLVE_BUDGET_GENERAL = 80   # 일반 기사 URL 해제 최대 개수
-RESOLVE_BUDGET_NEXON = 30     # 넥슨 URL 해제 최대 개수
+# 리다이렉트 해제는 "보낼 기사" + 백필 일부만 수행 (경량)
+RESOLVE_BUDGET_GENERAL = 80
+RESOLVE_BUDGET_NEXON = 30
 
 SLACK_TEXT_LIMIT = 3500
 TITLE_MAX = 120
@@ -80,13 +84,13 @@ GAME_CONTEXT_QUERY = "(" + " OR ".join(GAME_CONTEXT_OR) + ")"
 
 # 게시글/커뮤니티성(공략/길드모집 등) 1차 컷: 제목/요약 기반
 NON_ARTICLE_TITLE_HINTS = [
-    "공략", "팁", "노하우", "질문", "Q&A", "인증", "후기", "스샷", "스크린샷",
-    "길드", "길드모집", "모집", "파티", "팟", "고정팟", "클랜", "클랜모집",
+    "공략", "팁", "노하우", "질문", "q&a", "인증", "후기", "스샷", "스크린샷",
+    "길드", "길드모집", "길드 모집", "모집", "파티", "팟", "고정팟", "클랜", "클랜모집",
     "거래", "나눔", "판매", "삽니다",
-    "버그제보", "건의", "토론",
+    "버그제보", "버그 제보", "건의", "토론",
 ]
 
-# Inven URL 패턴 필터(원문 URL 기준으로만 적용)
+# Inven URL 패턴 필터(원문 URL 기준)
 def is_valid_article_url(url: str) -> bool:
     if not url:
         return False
@@ -96,20 +100,17 @@ def is_valid_article_url(url: str) -> bool:
         path = (p.path or "").lower()
         qs = parse_qs(p.query or "")
     except Exception:
-        return True  # 파싱 실패는 과하게 버리기보다 통과
+        return True  # 파싱 실패는 과하게 버리지 않음
 
     # 인벤: board는 기사 아님, keyword 리스트도 기사 아님
     if host.endswith("inven.co.kr"):
         if "/board/" in path:
             return False
-        if path.startswith("/webzine/news") or path.startswith("/webzine/news/"):
-            # 기사면 news=가 있어야 함
+        if path.startswith("/webzine/news"):
             if "news" not in qs:
                 return False
-        # news 없이 keyword만 있는 리스트 페이지 제거
         if "keyword" in qs and "news" not in qs:
             return False
-
     return True
 
 # 넥슨 검증(제목/요약에 넥슨이 실제 포함되어야만 넥슨 섹션에 포함)
@@ -177,7 +178,6 @@ def _site_or_query(sites: List[str]) -> str:
     return "(" + " OR ".join([f"site:{s}" for s in sites]) + ")"
 
 def _press_guess(entry) -> str:
-    # Google News RSS는 source.title로 언론사 이름이 들어오는 경우가 많음(표시용)
     try:
         src = getattr(entry, "source", None)
         if src and isinstance(src, dict):
@@ -192,7 +192,6 @@ def _yesterday_range_kst() -> Tuple[str, str, str]:
     now = datetime.now(KST)
     today = now.date()
     yday = today - timedelta(days=1)
-    # Google search operator: after/before는 날짜 문자열 사용
     return yday.isoformat(), yday.isoformat(), today.isoformat()
 
 def _looks_like_non_article(title: str, snippet: str) -> bool:
@@ -200,9 +199,7 @@ def _looks_like_non_article(title: str, snippet: str) -> bool:
     return any(h.lower() in blob for h in NON_ARTICLE_TITLE_HINTS)
 
 # ==========================
-# 핵심: Google 중간 링크 -> 원문 URL 해제 (경량)
-# - HEAD 시도 -> 막히면 GET stream (본문 다운로드 없음)
-# - 캐시로 중복 해제 방지
+# Google 중간 링크 -> 원문 URL 해제 (경량)
 # ==========================
 class UrlResolver:
     def __init__(self):
@@ -220,13 +217,13 @@ class UrlResolver:
             return self.cache[url]
 
         final_url = url
+        # 1) HEAD
         try:
-            # 1) HEAD allow_redirects
             r = self.session.head(url, allow_redirects=True, timeout=REQUEST_TIMEOUT)
             if r.url:
                 final_url = r.url
         except Exception:
-            # 2) fallback: GET stream (본문 다운로드 없이)
+            # 2) GET stream
             try:
                 r = self.session.get(url, allow_redirects=True, timeout=REQUEST_TIMEOUT, stream=True)
                 if r.url:
@@ -242,19 +239,17 @@ class UrlResolver:
         return final_url
 
 # ==========================
-# 쿼리 빌더
+# 쿼리 빌더 (전날 범위 고정)
 # ==========================
 def build_query_general(keyword: str, sites: List[str], after: str, before: str) -> str:
-    # 전날 고정 after/before
     return f"{GAME_CONTEXT_QUERY} {keyword} {_site_or_query(sites)} after:{after} before:{before}"
 
 def build_query_nexon(keyword: str, sites: List[str], after: str, before: str) -> str:
-    # 넥슨은 키워드+넥슨 교집합
     nexon_expr = '("넥슨" OR Nexon OR "넥슨게임즈" OR 네오플)'
     return f'{nexon_expr} {keyword} {_site_or_query(sites)} after:{after} before:{before}'
 
 # ==========================
-# RSS 수집 (링크는 아직 google link 상태로 저장)
+# RSS 수집 (link는 google link 상태로 저장)
 # ==========================
 def fetch_track(track: str,
                 keywords: List[str],
@@ -302,7 +297,6 @@ def fetch_track(track: str,
                 snippet_raw = getattr(e, "summary", "") or getattr(e, "description", "") or ""
                 snippet = _truncate(_clean_text(_strip_html(snippet_raw)), SNIPPET_MAX)
 
-                # 1차: 제목/요약 기반으로 공략/길드모집 등 컷 (매우 가벼움)
                 if _looks_like_non_article(title, snippet):
                     stats["non_article_hint_drop"] += 1
                     continue
@@ -319,8 +313,8 @@ def fetch_track(track: str,
                     "keyword": kw,
                     "press": press,
                     "title": _truncate(title, TITLE_MAX),
-                    "google_link": google_link,   # 중간 링크
-                    "link": google_link,          # 최종적으로 원문으로 교체할 예정
+                    "google_link": google_link,
+                    "link": google_link,  # 나중에 원문으로 교체
                     "published_dt": published_dt,
                     "published": published_dt.strftime("%Y-%m-%d %H:%M") if published_dt else "",
                     "snippet": snippet,
@@ -332,56 +326,48 @@ def fetch_track(track: str,
             print(f"[WARN] RSS call failed ({track} kw={kw}): {ex}")
             continue
 
-    # 최신순 기본 정렬
     def sort_key(a: Dict) -> datetime:
         return a["published_dt"] if a.get("published_dt") else datetime.min
 
-    items = sorted(list(found.values()), key=sort_key, reverse=True)
-    return items, stats
+    return sorted(list(found.values()), key=sort_key, reverse=True), stats
 
 # ==========================
-# 링크 해제 + URL 패턴 필터 적용 + 백필
+# 링크 해제 + URL 패턴 필터 + 중복 제거
 # ==========================
 def finalize_links_and_filter(items: List[Dict], resolver: UrlResolver, budget: int) -> Tuple[List[Dict], Dict[str, int]]:
     stats = {
         "resolved": 0,
         "url_pattern_drop": 0,
-        "resolve_failed_or_google_left": 0,
+        "resolve_budget_left_google": 0,
     }
 
     out: List[Dict] = []
     used = 0
 
     for a in items:
-        if used >= budget:
-            # 예산 넘으면 google 링크 그대로(단, 인벤 게시판 같은 걸 못 걸러서 위험)
-            # -> 예산은 SEND_LIMIT보다 여유 있게 잡아둠(위에서 80/30)
-            a["link"] = a["google_link"]
-            stats["resolve_failed_or_google_left"] += 1
-            out.append(a)
-            continue
+        if used < budget:
+            final = resolver.resolve(a.get("google_link", ""))
+            used += 1
+            stats["resolved"] += 1
+            a["link"] = final
+        else:
+            # 예산 초과 시 google 링크 그대로(권장: 예산을 SEND_LIMIT보다 크게 유지)
+            a["link"] = a.get("google_link", "")
+            stats["resolve_budget_left_google"] += 1
 
-        g = a.get("google_link", "")
-        final = resolver.resolve(g)
-        used += 1
-        stats["resolved"] += 1
-
-        a["link"] = final
-
-        # 원문 URL 패턴으로 "기사 아닌 링크" 확실하게 제거
-        if not is_valid_article_url(final):
+        # URL 패턴 필터(원문 기준). google 링크면 통과할 수 있으니 예산을 넉넉히 잡는게 중요.
+        if not is_valid_article_url(a["link"]):
             stats["url_pattern_drop"] += 1
             continue
 
         out.append(a)
 
-    # 중복(원문 URL 기준)
+    # 원문 기준 중복 제거
     dedup: Dict[str, Dict] = {}
     for a in out:
         sid = _stable_id(a.get("title",""), a.get("link",""))
         dedup[sid] = a
 
-    # 다시 최신순 정렬
     def sort_key(a: Dict) -> datetime:
         return a["published_dt"] if a.get("published_dt") else datetime.min
 
@@ -408,11 +394,11 @@ def build_messages(general: List[Dict], nexon: List[Dict],
         for a in general[:GENERAL_SEND_LIMIT]:
             body += fmt(a)
 
-    # 넥슨: 정확도 강제(제목/요약 넥슨 포함) + 중요도 Top 5
+    body += "\n---\n### 🏢 넥슨 관련 주요 뉴스 (Top 5)\n"
+    # 넥슨: 정확도 강제(제목/요약에 넥슨 포함)
     nexon_true = [a for a in nexon if contains_nexon(a.get("title",""), a.get("snippet",""))]
     nexon_sorted = sorted(nexon_true, key=lambda x: (nexon_score(x), x["published_dt"] or datetime.min), reverse=True)
 
-    body += "\n---\n### 🏢 넥슨 관련 주요 뉴스 (Top 5)\n"
     if not nexon_sorted:
         body += "- 전날 기준 넥슨 관련 주요 뉴스를 찾지 못했습니다.\n"
     else:
@@ -421,7 +407,6 @@ def build_messages(general: List[Dict], nexon: List[Dict],
 
     full = header + body
 
-    # Slack 길이 분할
     messages: List[str] = []
     chunk = ""
     for line in full.splitlines(True):
@@ -437,7 +422,6 @@ def build_messages(general: List[Dict], nexon: List[Dict],
 def send_to_slack(message: str) -> None:
     if not SLACK_WEBHOOK_URL:
         raise RuntimeError("환경변수 SLACK_WEBHOOK_URL이 설정되어 있지 않습니다.")
-
     payload = {"text": message}
     resp = requests.post(
         SLACK_WEBHOOK_URL,
@@ -453,7 +437,7 @@ def send_to_slack(message: str) -> None:
 def main() -> None:
     yday_label, after, before = _yesterday_range_kst()
 
-    # 1) RSS로 후보 수집
+    # 1) RSS 후보 수집
     general_keywords = PRIMARY_KEYWORDS[:KEYWORD_BATCH_PRIMARY]
     general_items, stats_general_rss = fetch_track(
         track="general",
@@ -463,7 +447,8 @@ def main() -> None:
         after=after,
         before=before,
     )
-    # 너무 적으면 키워드 확장
+
+    # 너무 적으면 확장
     if len(general_items) < 10:
         general_items, stats_general_rss = fetch_track(
             track="general",
@@ -483,12 +468,12 @@ def main() -> None:
         before=before,
     )
 
-    # 2) "보낼 만큼만" 리다이렉트 해제해서 원문 URL 확정 + URL 패턴 필터
+    # 2) 링크 해제(예산 내) + URL 패턴 필터
     resolver = UrlResolver()
     general_final, stats_general_finalize = finalize_links_and_filter(general_items, resolver, RESOLVE_BUDGET_GENERAL)
     nexon_final, stats_nexon_finalize = finalize_links_and_filter(nexon_items, resolver, RESOLVE_BUDGET_NEXON)
 
-    # 3) 디버그 미리보기(액션 로그용)
+    # 3) 디버그 로그
     print(f"[INFO] KST range: after={after} before={before} (yday={yday_label})")
     print(f"[INFO] general rss={len(general_items)} final={len(general_final)}")
     print(f"[INFO] nexon rss={len(nexon_items)} final={len(nexon_final)}")
