@@ -1,0 +1,38 @@
+# GitHub Actions 워크플로우 설정
+name: Daily Game News Scraper
+
+# 언제 실행할지 설정: 매일 UTC 1시에 실행 (한국 시간 오전 10시)
+on:
+  schedule:
+    - cron: '0 1 * * *'
+  # 수동으로도 실행할 수 있도록 버튼 추가
+  workflow_dispatch:
+
+# 어떤 작업을 할지 설정
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    # 1. 내 레포지토리의 코드를 가져옴
+    - name: Checkout repository
+      uses: actions/checkout@v3
+
+    # 2. 파이썬 3.9 환경을 설정
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+
+    # 3. 코드 실행에 필요한 라이브러리들을 설치
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install feedparser requests googlesearch-python
+
+    # 4. main.py 스크립트를 실행
+    - name: Run Python script
+      env:
+        # 3단계에서 저장한 비밀 웹훅 URL을 코드에서 사용할 수 있게 전달 (지금은 비어있음)
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      run: python main.py
