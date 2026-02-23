@@ -1,19 +1,25 @@
 # ------------------------------------------------------------------
-# [수정본] googlesearch-python advanced + tbs(cdr)로 제목/기간 정확도 개선 (2026-02-23)
+# [최적 운영용] Google News RSS + 본문 요약 + Slack 전송(자동 분할) (2026-02-23)
+# - googlesearch-python 사용 안 함 (차단/0건 리스크 제거)
+# - requirements.txt: requests, feedparser, beautifulsoup4, lxml, trafilatura
 # ------------------------------------------------------------------
 import os
+import re
 import json
 import time
+import hashlib
 import random
-import requests
 from datetime import datetime, timedelta
-from urllib.parse import urlparse, parse_qs, urlunparse
+from urllib.parse import quote, urlparse, parse_qs, urlunparse
 
-# pip install googlesearch-python
-from googlesearch import search
+import requests
+import feedparser
+from bs4 import BeautifulSoup
 
-# --- (1) 설정 부분 ---
-SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL")  # KeyError 방지
+# ==========================
+# 설정
+# ==========================
+SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL")
 
 TARGET_SITES = [
     "inven.co.kr",
@@ -31,15 +37,36 @@ PRIMARY_KEYWORDS = [
 ]
 
 SEARCH_DAYS = 14
-MAX_RESULTS_PER_QUERY = 5
+MAX_ITEMS_PER_QUERY = 12
 
-# --- (2) 유틸 ---
+REQUEST_TIMEOUT = 12
+USER_AGENT = "Mozilla/5.0 (NewsDigestBot/1.0; SlackWebhook)"
+SLEEP_BETWEEN_REQUESTS = (0.2, 0.6)
+
+SUMMARY_CHARS = 320
+
+# Slack 텍스트가 너무 길면 실패/잘림 위험 → 보수적으로 분할
+SLACK_TEXT_LIMIT = 3500
+
+
+# ==========================
+# 유틸
+# ==========================
+def _sleep():
+    time.sleep(random.uniform(*SLEEP_BETWEEN_REQUESTS))
+
+def _clean_text(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip())
+
+def _truncate(s: str, n: int) -> str:
+    s = s or ""
+    return s if len(s) <= n else s[: max(0, n - 1)] + "…"
+
 def _normalize_url(raw_url: str) -> str:
     """
-    Google 결과에 종종 섞이는 리다이렉트/트래킹/프래그먼트 제거.
-    - https://www.google.com/url?q=... 형태면 q 파라미터를 실제 URL로 사용
-    - fragment(#...) 제거
-    - 흔한 UTM 제거
+    - google.com/url?q=... 형태면 q에서 실 URL 복원
+    - fragment 제거
+    - utm_* 제거
     """
     if not raw_url:
         return raw_url
@@ -54,146 +81,242 @@ def _normalize_url(raw_url: str) -> str:
     except Exception:
         pass
 
+    # UTM 제거 + fragment 제거
     try:
         p = urlparse(raw_url)
         qs = parse_qs(p.query)
-        # UTM 제거
         for k in list(qs.keys()):
             if k.lower().startswith("utm_"):
                 qs.pop(k, None)
 
-        # query 재조립
-        new_query = "&".join(
-            f"{k}={v[0]}" if len(v) == 1 else "&".join([f"{k}={x}" for x in v])
-            for k, v in qs.items()
-        )
-        cleaned = urlunparse((p.scheme, p.netloc, p.path, p.params, new_query, ""))  # fragment 제거
-        return cleaned
+        parts = []
+        for k, vs in qs.items():
+            for v in vs:
+                parts.append(f"{k}={v}")
+        new_query = "&".join(parts)
+
+        return urlunparse((p.scheme, p.netloc, p.path, p.params, new_query, ""))
     except Exception:
         return raw_url
 
 def _press_from_url(url: str) -> str:
-    """도메인에서 언론사/매체 라벨 생성(간단 버전)."""
     try:
-        netloc = urlparse(url).netloc.lower()
-        netloc = netloc.replace("www.", "")
-        # 예: zdnet.co.kr -> zdnet
-        base = netloc.split(".")[0]
-        return base.upper() if base else "NEWS"
+        netloc = urlparse(url).netloc.lower().replace("www.", "")
+        return netloc.split(".")[0].upper() if netloc else "NEWS"
     except Exception:
         return "NEWS"
 
-def _build_tbs_custom_range(start_dt: datetime, end_dt: datetime) -> str:
+def _stable_id(title: str, link: str) -> str:
+    return hashlib.sha1(f"{title}||{link}".encode("utf-8")).hexdigest()[:16]
+
+def _parse_published(entry) -> datetime | None:
+    t = getattr(entry, "published_parsed", None) or getattr(entry, "updated_parsed", None)
+    if not t:
+        return None
+    try:
+        return datetime(*t[:6])
+    except Exception:
+        return None
+
+def _within_days(dt: datetime | None, days: int) -> bool:
+    if not dt:
+        # 날짜가 없으면 포함(너무 엄격하면 결과가 0 될 수 있음)
+        return True
+    return dt >= (datetime.now() - timedelta(days=days))
+
+def _google_news_rss_url(keyword: str, site: str, days: int) -> str:
+    # when:Nd는 최근 N일 중심으로 결과를 안정적으로 끌어오는 편
+    q = f'"{keyword}" site:{site} when:{days}d'
+    return "https://news.google.com/rss/search?q=" + quote(q) + "&hl=ko&gl=KR&ceid=KR:ko"
+
+
+# ==========================
+# 본문 요약 추출
+# ==========================
+def extract_summary(url: str, session: requests.Session) -> str:
     """
-    Google 검색 tbs 커스텀 기간:
-    tbs=cdr:1,cd_min:MM/DD/YYYY,cd_max:MM/DD/YYYY
-    (googlesearch-python이 tbs를 그대로 전달할 수 있음) :contentReference[oaicite:2]{index=2}
+    우선: trafilatura (설치되어 있으면)
+    fallback: og/meta description + 첫 문단 조합
     """
-    cd_min = start_dt.strftime("%m/%d/%Y")
-    cd_max = end_dt.strftime("%m/%d/%Y")
-    return f"cdr:1,cd_min:{cd_min},cd_max:{cd_max}"
+    # 1) trafilatura (optional)
+    try:
+        import trafilatura  # type: ignore
+        downloaded = trafilatura.fetch_url(url)
+        if downloaded:
+            text = trafilatura.extract(
+                downloaded,
+                include_comments=False,
+                include_tables=False,
+                favor_recall=False,
+            )
+            text = _clean_text(text)
+            if text:
+                return _truncate(text, SUMMARY_CHARS)
+    except Exception:
+        pass
 
-# --- (3) 메인 로직 ---
-def find_news_by_google():
-    now = datetime.now()
-    start_dt = now - timedelta(days=SEARCH_DAYS)
-    end_dt = now
+    # 2) BeautifulSoup fallback
+    try:
+        resp = session.get(url, timeout=REQUEST_TIMEOUT)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "lxml")
 
-    tbs = _build_tbs_custom_range(start_dt, end_dt)
+        meta = soup.find("meta", attrs={"property": "og:description"}) or soup.find("meta", attrs={"name": "description"})
+        desc = _clean_text(meta.get("content")) if meta and meta.get("content") else ""
 
-    found_articles = {}  # normalized_url -> article
+        paras = []
+        for p in soup.find_all("p"):
+            t = _clean_text(p.get_text(" ", strip=True))
+            if len(t) >= 35:
+                paras.append(t)
+            if len(" ".join(paras)) >= 900:
+                break
 
-    for keyword in PRIMARY_KEYWORDS:
+        combined = _clean_text(" ".join([desc] + paras))
+        return _truncate(combined, SUMMARY_CHARS) if combined else ""
+    except Exception:
+        return ""
+
+
+# ==========================
+# RSS 수집
+# ==========================
+def fetch_articles() -> list[dict]:
+    session = requests.Session()
+    session.headers.update({"User-Agent": USER_AGENT})
+
+    articles = {}  # sid -> article
+
+    for kw in PRIMARY_KEYWORDS:
         for site in TARGET_SITES:
-            query = f'"{keyword}" site:{site}'
+            rss = _google_news_rss_url(kw, site, SEARCH_DAYS)
             try:
-                # advanced=True면 title/url/description을 받음 :contentReference[oaicite:3]{index=3}
-                # tbs로 기간 강제 :contentReference[oaicite:4]{index=4}
-                results = search(
-                    query,
-                    lang="ko",
-                    advanced=True,
-                    tbs=tbs,
-                    num=MAX_RESULTS_PER_QUERY,
-                    stop=MAX_RESULTS_PER_QUERY,
-                    pause=random.uniform(2.0, 3.5),
-                )
+                resp = session.get(rss, timeout=REQUEST_TIMEOUT)
+                resp.raise_for_status()
+                feed = feedparser.parse(resp.text)
 
-                for r in results:
-                    # r: SearchResult (title, url, description) :contentReference[oaicite:5]{index=5}
-                    url = _normalize_url(getattr(r, "url", "") or "")
-                    if not url:
+                got = 0
+                for entry in feed.entries:
+                    if got >= MAX_ITEMS_PER_QUERY:
+                        break
+
+                    title = _clean_text(getattr(entry, "title", ""))
+                    link = _normalize_url(_clean_text(getattr(entry, "link", "")))
+                    published_dt = _parse_published(entry)
+
+                    if not title or not link:
+                        continue
+                    # 안전망: 지정 도메인만
+                    if site not in link:
+                        continue
+                    # 날짜 안전망
+                    if not _within_days(published_dt, SEARCH_DAYS):
                         continue
 
-                    # 도메인 필터(안전망)
-                    if site not in url:
+                    sid = _stable_id(title, link)
+                    if sid in articles:
                         continue
 
-                    title = (getattr(r, "title", "") or "").strip()
-                    desc = (getattr(r, "description", "") or "").strip()
+                    articles[sid] = {
+                        "keyword": kw,
+                        "press": _press_from_url(link),
+                        "title": title,
+                        "link": link,
+                        "published_dt": published_dt,
+                        "published": published_dt.strftime("%Y-%m-%d %H:%M") if published_dt else "",
+                        "summary": "",
+                    }
+                    got += 1
 
-                    # 제목이 비어있으면(가끔 있음) 마지막 fallback으로 URL 조각 사용
-                    if not title:
-                        title = urlparse(url).path.strip("/").split("/")[-1].replace("-", " ").replace("_", " ")
-
-                    if url not in found_articles:
-                        found_articles[url] = {
-                            "press": _press_from_url(url),
-                            "title": title,
-                            "link": url,
-                            "desc": desc,
-                        }
-
-                # (선택) 쿼리 사이 약간 쉬어주기(차단/429 방지)
-                time.sleep(random.uniform(0.3, 0.8))
-
+                _sleep()
             except Exception as e:
-                print(f"[WARN] 구글 검색 오류 (keyword={keyword}, site={site}): {e}")
+                print(f"[WARN] RSS 실패 (kw={kw}, site={site}): {e}")
                 continue
 
-    all_articles = list(found_articles.values())
+    # 요약 채우기
+    for a in articles.values():
+        a["summary"] = extract_summary(a["link"], session)
+        _sleep()
 
-    # 넥슨 관련: title/desc/url 모두에서 탐지 (기존보다 정확)
-    def is_nexon(a):
-        blob = f"{a.get('title','')} {a.get('desc','')} {a.get('link','')}".lower()
-        return ("넥슨" in blob) or ("nexon" in blob)
+    # 최신순 정렬 (published_dt 없는 건 뒤로)
+    def sort_key(x: dict):
+        return x["published_dt"] if x.get("published_dt") else datetime.min
 
-    nexon_articles = [a for a in all_articles if is_nexon(a)]
-    return all_articles, nexon_articles
+    return sorted(articles.values(), key=sort_key, reverse=True)
 
-def create_report_message():
-    all_articles, nexon_articles = find_news_by_google()
+
+# ==========================
+# Slack 메시지 생성/전송
+# ==========================
+def is_nexon(article: dict) -> bool:
+    blob = f"{article.get('title','')} {article.get('summary','')} {article.get('link','')}".lower()
+    return ("넥슨" in blob) or ("nexon" in blob)
+
+def build_messages(articles: list[dict]) -> list[str]:
     today_str = datetime.now().strftime("%Y-%m-%d")
+    header = f"## 📰 {today_str} 게임업계 뉴스 브리핑 (최근 {SEARCH_DAYS}일, Google News RSS)\n"
+    header += f"- 대상 사이트: {', '.join(TARGET_SITES)}\n"
+    header += f"- 키워드: {', '.join(PRIMARY_KEYWORDS)}\n\n"
 
-    msg = f"## 📰 {today_str} 게임업계 뉴스 브리핑 (최근 {SEARCH_DAYS}일, Google 검색)\n\n"
+    def fmt(a: dict) -> str:
+        pub = f" ({a['published']})" if a.get("published") else ""
+        summ = f"\n    - {_truncate(a.get('summary',''), 500)}" if a.get("summary") else ""
+        return f"▶ *[{a['press']}]* <{a['link']}|{a['title']}>{pub}{summ}\n"
 
-    msg += "### 🌐 주요 게임업계 뉴스\n"
-    if not all_articles:
-        msg += f"- 최근 {SEARCH_DAYS}일간, 지정된 키워드를 포함한 주요 뉴스가 없습니다.\n\n"
+    major = articles
+    nexon = [a for a in articles if is_nexon(a)]
+
+    body = "### 🌐 주요 게임업계 뉴스\n"
+    if not major:
+        body += f"- 최근 {SEARCH_DAYS}일간, 지정 조건의 뉴스가 없습니다.\n"
     else:
-        for a in all_articles:
-            # Slack 링크 포맷: <url|text>
-            msg += f"▶ *[{a['press']}]* <{a['link']}|{a['title']}>\n"
-        msg += "\n"
+        for a in major:
+            body += fmt(a)
 
-    msg += "---\n### 🏢 넥슨 관련 주요 뉴스\n"
-    if not nexon_articles:
-        msg += "- 위 기사들 중, '넥슨' 관련 키워드를 포함한 뉴스는 없습니다.\n"
+    body += "\n---\n### 🏢 넥슨 관련 주요 뉴스\n"
+    if not nexon:
+        body += "- '넥슨' 관련 기사(제목/요약/URL 기준)가 없습니다.\n"
     else:
-        for a in nexon_articles:
-            msg += f"▶ *[{a['press']}]* <{a['link']}|{a['title']}>\n"
+        for a in nexon:
+            body += fmt(a)
 
-    return msg
+    full = header + body
 
-def send_to_slack(message: str):
+    # Slack 길이 제한 대응: 라인 단위 분할
+    messages = []
+    chunk = ""
+    for line in full.splitlines(True):
+        if len(chunk) + len(line) > SLACK_TEXT_LIMIT:
+            messages.append(chunk)
+            chunk = ""
+        chunk += line
+    if chunk.strip():
+        messages.append(chunk)
+
+    return messages
+
+def send_to_slack_text(message: str):
     if not SLACK_WEBHOOK_URL:
         raise RuntimeError("환경변수 SLACK_WEBHOOK_URL이 설정되어 있지 않습니다.")
 
     payload = {"text": message}
-    headers = {"Content-Type": "application/json"}
-    resp = requests.post(SLACK_WEBHOOK_URL, data=json.dumps(payload), headers=headers, timeout=15)
+    resp = requests.post(
+        SLACK_WEBHOOK_URL,
+        data=json.dumps(payload),
+        headers={"Content-Type": "application/json"},
+        timeout=15,
+    )
     resp.raise_for_status()
 
+def main():
+    articles = fetch_articles()
+    print(f"[INFO] fetched articles: {len(articles)}")
+    messages = build_messages(articles)
+
+    for i, msg in enumerate(messages, 1):
+        send_to_slack_text(msg)
+        print(f"[INFO] sent slack message {i}/{len(messages)}")
+        time.sleep(0.5)
+
 if __name__ == "__main__":
-    report = create_report_message()
-    send_to_slack(report)
+    main()
