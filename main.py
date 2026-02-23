@@ -1,13 +1,10 @@
 # ------------------------------------------------------------------
-# [v4.5] FIX: google 링크 제거(원문 추출), 기사 아닌 페이지 제거, 주말/공휴일 누적 범위
-# - Python 3.9
-# - 경량 원칙:
-#   * RSS 수집은 그대로
-#   * 원문 URL resolve는 "슬랙에 보낼 후보" 위주로만 수행
-#   * 본문 크롤링/요약 없음 (HTML은 원문 링크 추출용으로 소량만 읽음)
-# - 링크 정책:
-#   * news.google.com 링크는 원문으로 변환 성공 시에만 슬랙에 송출
-#   * 변환 실패면 해당 항목 drop (google 링크를 보내지 않음)
+# [v4.5.2] FIX: 날짜/타임존 파싱 교정 + 오래된 기사(예:2010) 강제 제거
+# - 핵심 수정:
+#   * published_parsed를 'KST로 간주'하지 않음
+#   * entry.published/updated 문자열을 parsedate_to_datetime()로 파싱(aware)
+#   * tzinfo 없으면 UTC로 가정 후 KST 변환
+#   * window 필터는 KST-aware로만 비교
 # ------------------------------------------------------------------
 import os
 import re
@@ -16,19 +13,20 @@ import time
 import hashlib
 import random
 from typing import Dict, List, Optional, Tuple
-from datetime import datetime, timedelta, time as dtime
+from datetime import datetime, timedelta, time as dtime, timezone
 from urllib.parse import quote, urlparse, parse_qs, unquote
+from email.utils import parsedate_to_datetime
 
 import requests
 import feedparser
 from zoneinfo import ZoneInfo
 
-# ✅ 공휴일 계산(설/추석/대체공휴일 포함)용
-import holidays  # pip install holidays
+# holidays는 선택(없으면 주말만 처리)
+try:
+    import holidays as holidays_lib  # pip install holidays
+except Exception:
+    holidays_lib = None
 
-# ==========================
-# 설정
-# ==========================
 SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL")
 
 TARGET_SITES = [
@@ -51,10 +49,10 @@ KEYWORD_BATCH_FALLBACK = 18
 
 KST = ZoneInfo("Asia/Seoul")
 SEND_HOUR = 10
-END_CUTOFF = dtime(9, 59, 59)  # "오늘 09:59:59까지"를 전날/누적 범위의 종료로 사용
+END_CUTOFF = dtime(9, 59, 59)
 
 REQUEST_TIMEOUT = 12
-USER_AGENT = "Mozilla/5.0 (GameNewsBot/1.5; SlackWebhook)"
+USER_AGENT = "Mozilla/5.0 (GameNewsBot/1.52; SlackWebhook)"
 SLEEP_BETWEEN_FEEDS = (0.05, 0.12)
 
 MAX_ENTRIES_PER_FEED = 30
@@ -63,7 +61,6 @@ MAX_ENTRIES_PER_NEXON_FEED = 20
 GENERAL_SEND_LIMIT = 50
 NEXON_SEND_LIMIT = 5
 
-# 원문 URL 변환(해제) 예산: "후보"만 처리
 RESOLVE_BUDGET_GENERAL = 120
 RESOLVE_BUDGET_NEXON = 60
 
@@ -72,9 +69,6 @@ TITLE_MAX = 120
 SNIPPET_MAX = 180
 PREVIEW_TOP_N = 10
 
-# ==========================
-# 컨텍스트/필터
-# ==========================
 GAME_CONTEXT_OR = [
     "게임", "게이밍", "게임업계", "게임사", "퍼블리셔", "개발사",
     "모바일게임", "PC게임", "콘솔", "스팀", "Steam", "PS5", "플레이스테이션", "닌텐도", "Xbox",
@@ -82,7 +76,6 @@ GAME_CONTEXT_OR = [
 ]
 GAME_CONTEXT_QUERY = "(" + " OR ".join(GAME_CONTEXT_OR) + ")"
 
-# 공략/길드모집 등 게시물 1차 컷(가벼운 텍스트 필터)
 NON_ARTICLE_HINTS = [
     "공략", "팁", "노하우", "질문", "q&a", "인증", "후기",
     "길드", "길드모집", "길드 모집", "모집", "클랜", "클랜모집",
@@ -90,7 +83,6 @@ NON_ARTICLE_HINTS = [
     "거래", "나눔", "판매", "삽니다",
 ]
 
-# 넥슨 검증
 NEXON_TERMS = ["넥슨", "nexon", "넥슨코리아", "넥슨게임즈", "네오플", "넥슨네트웍스"]
 NEXON_IMPORTANCE = [
     ("M&A", 5), ("인수", 5), ("합병", 5),
@@ -115,9 +107,6 @@ def nexon_score(a: Dict) -> int:
         score += 2
     return score
 
-# ==========================
-# 유틸
-# ==========================
 def _clean(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip())
 
@@ -130,17 +119,6 @@ def _truncate(s: str, n: int) -> str:
 
 def _stable_id(title: str, link: str) -> str:
     return hashlib.sha1((title + "||" + link).encode("utf-8")).hexdigest()[:16]
-
-def _parse_published(entry) -> Optional[datetime]:
-    t = getattr(entry, "published_parsed", None) or getattr(entry, "updated_parsed", None)
-    if not t:
-        return None
-    try:
-        # RSS published_parsed는 "naive UTC 비슷"으로 취급되는 경우가 많음
-        # 우선 naive datetime으로 만들고, 비교는 KST-aware로 변환해서 처리
-        return datetime(*t[:6])
-    except Exception:
-        return None
 
 def _sleep():
     time.sleep(random.uniform(*SLEEP_BETWEEN_FEEDS))
@@ -166,9 +144,6 @@ def _looks_like_non_article(title: str, snippet: str) -> bool:
     blob = f"{title} {snippet}".lower()
     return any(h.lower() in blob for h in NON_ARTICLE_HINTS)
 
-# ==========================
-# "기사 URL" 판정(원문 URL 기준)
-# ==========================
 def is_valid_article_url(url: str) -> bool:
     if not url:
         return False
@@ -180,11 +155,9 @@ def is_valid_article_url(url: str) -> bool:
     except Exception:
         return False
 
-    # 홈/루트는 기사로 보지 않음
     if path in ("", "/"):
         return False
 
-    # Inven: board/ 제외 + webzine/news 는 news= 있어야 기사
     if host.endswith("inven.co.kr"):
         if "/board/" in path:
             return False
@@ -194,49 +167,74 @@ def is_valid_article_url(url: str) -> bool:
         if "keyword" in qs and "news" not in qs:
             return False
 
-    # (필요하면 다른 사이트도 비기사 패턴을 추가 가능)
     return True
 
-# ==========================
-# 날짜 범위: 주말/공휴일 누적
-# - end: 오늘 09:59:59 (KST)
-# - start:
-#   * "바로 직전 영업일"을 찾는다
-#   * 기본은 직전 영업일 10:00
-#   * 단, 월요일(또는 연휴 후 첫 영업일)에는 누적이 커지므로:
-#       - '직전 영업일이 금요일'이면 start를 금요일 00:00으로(너의 월요일 예시 반영)
-#       - 그 외는 직전 영업일 10:00 (너의 연휴 예시 반영)
-# ==========================
-def compute_window_kst(now_kst: datetime) -> Tuple[datetime, datetime, str]:
-    kr_holidays = holidays.country_holidays("KR", years=[now_kst.year, now_kst.year - 1])
+# ✅ 날짜 파싱(가장 중요한 수정)
+def parse_entry_datetime_kst(entry) -> Optional[datetime]:
+    """
+    1) entry.published / entry.updated 문자열을 parsedate_to_datetime으로 파싱 (aware)
+    2) tzinfo 없으면 UTC로 가정
+    3) KST로 변환
+    """
+    for attr in ("published", "updated"):
+        s = getattr(entry, attr, None)
+        if s:
+            try:
+                dt = parsedate_to_datetime(s)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return dt.astimezone(KST)
+            except Exception:
+                pass
 
+    # fallback: published_parsed/updated_parsed (tz 모르면 UTC로 가정)
+    for attr in ("published_parsed", "updated_parsed"):
+        t = getattr(entry, attr, None)
+        if t:
+            try:
+                naive = datetime(*t[:6])
+                return naive.replace(tzinfo=timezone.utc).astimezone(KST)
+            except Exception:
+                pass
+
+    return None
+
+def compute_window_kst(now_kst: datetime) -> Tuple[datetime, datetime, str]:
     end_dt = datetime.combine(now_kst.date(), END_CUTOFF, tzinfo=KST)
 
-    # 직전 영업일 찾기
-    d = now_kst.date() - timedelta(days=1)
-    while True:
-        is_weekday = d.weekday() < 5
-        is_holiday = d in kr_holidays
-        if is_weekday and not is_holiday:
-            prev_business = d
-            break
-        d = d - timedelta(days=1)
+    kr_holidays = None
+    if holidays_lib is not None:
+        try:
+            kr_holidays = holidays_lib.country_holidays("KR", years=[now_kst.year, now_kst.year - 1])
+        except Exception:
+            kr_holidays = None
 
-    # 기본 start: 직전 영업일 10:00
+    if kr_holidays is None:
+        print("[WARN] holidays 미설치/오류로 공휴일은 제외하지 않고 주말만 누적 처리합니다. "
+              "정확한 공휴일 반영이 필요하면 requirements.txt에 holidays를 추가하세요.")
+
+    def is_business_day(d) -> bool:
+        if d.weekday() >= 5:
+            return False
+        if kr_holidays is not None and d in kr_holidays:
+            return False
+        return True
+
+    d = now_kst.date() - timedelta(days=1)
+    while not is_business_day(d):
+        d -= timedelta(days=1)
+    prev_business = d
+
+    # 기본: 직전 영업일 10:00
     start_dt = datetime.combine(prev_business, dtime(SEND_HOUR, 0, 0), tzinfo=KST)
 
-    # 월요일이고 직전 영업일이 금요일이면: 금요일 00:00부터 누적(사용자 예시)
+    # 월요일 + 직전 영업일이 금요일이면 금요일 00:00부터(요구사항)
     if now_kst.weekday() == 0 and prev_business.weekday() == 4:
         start_dt = datetime.combine(prev_business, dtime(0, 0, 0), tzinfo=KST)
 
     label = f"{start_dt.strftime('%Y-%m-%d %H:%M')} ~ {end_dt.strftime('%Y-%m-%d %H:%M')} (KST)"
     return start_dt, end_dt, label
 
-# ==========================
-# 쿼리 빌더
-# - 구글 연산자는 시간 지정이 어려워 날짜만 넉넉히 잡고,
-# - 최종은 published_dt로 start~end 정확히 필터
-# ==========================
 def build_query_general(keyword: str, sites: List[str], after_date: str, before_date: str) -> str:
     return f"{GAME_CONTEXT_QUERY} {keyword} {_site_or_query(sites)} after:{after_date} before:{before_date}"
 
@@ -244,12 +242,6 @@ def build_query_nexon(keyword: str, sites: List[str], after_date: str, before_da
     nexon_expr = '("넥슨" OR Nexon OR "넥슨게임즈" OR 네오플)'
     return f'{nexon_expr} {keyword} {_site_or_query(sites)} after:{after_date} before:{before_date}'
 
-# ==========================
-# 원문 URL 추출(중간 링크 해결)
-# - 1) redirect 따라가보기
-# - 2) 그래도 google이면 HTML 조금 읽고 대상 도메인 URL을 regex로 추출
-# - 3) 실패 시 None (google 링크는 슬랙에 보내지 않음)
-# ==========================
 _GOOGLE_HOSTS = {"news.google.com", "www.google.com", "google.com"}
 
 def _is_google_url(url: str) -> bool:
@@ -262,9 +254,7 @@ def _is_google_url(url: str) -> bool:
 def _extract_best_candidate(html: str, target_sites: List[str]) -> Optional[str]:
     if not html:
         return None
-    # HTML 내 URL 후보를 대충 긁음(경량)
     candidates = re.findall(r"https?://[^\s\"'<>]+", html)
-    # 대상 사이트 포함 후보만
     filtered = []
     for u in candidates:
         u2 = u.split("&amp;")[0]
@@ -274,7 +264,6 @@ def _extract_best_candidate(html: str, target_sites: List[str]) -> Optional[str]
     if not filtered:
         return None
 
-    # 간단 점수: 인벤이면 webzine/news?news= 최우선
     def score(u: str) -> int:
         sc = 0
         if "inven.co.kr" in u:
@@ -284,7 +273,6 @@ def _extract_best_candidate(html: str, target_sites: List[str]) -> Optional[str]
                 sc -= 50
         if any(s in u for s in target_sites):
             sc += 10
-        # 너무 짧은 홈은 감점
         try:
             p = urlparse(u)
             if (p.path or "") in ("", "/"):
@@ -311,17 +299,14 @@ class UrlResolver:
         if google_url in self.cache:
             return self.cache[google_url]
 
-        # 1) redirect 시도
         final = google_url
+        html = ""
         try:
             r = self.session.get(google_url, allow_redirects=True, timeout=REQUEST_TIMEOUT, stream=True)
             if r.url:
                 final = r.url
-            # HTML 추출용으로 소량만 읽기
-            html = ""
             if _is_google_url(final):
                 try:
-                    # stream이라도 text를 조금만 읽기
                     chunk = next(r.iter_content(chunk_size=65536), b"")
                     html = chunk.decode("utf-8", errors="ignore")
                 except Exception:
@@ -334,25 +319,22 @@ class UrlResolver:
             self.cache[google_url] = None
             return None
 
-        # 이미 퍼블리셔면 그대로
         if not _is_google_url(final):
             self.cache[google_url] = final
             return final
 
-        # 2) google인 경우: HTML에서 퍼블리셔 후보 URL 뽑기
         cand = _extract_best_candidate(html, target_sites)
         if cand:
+            try:
+                cand = unquote(cand)
+            except Exception:
+                pass
             self.cache[google_url] = cand
             return cand
 
         self.cache[google_url] = None
         return None
 
-# ==========================
-# RSS 수집
-# - query after/before는 날짜 단위로 넉넉히
-# - 최종은 published_dt를 KST로 가정 변환해 start/end 범위 필터
-# ==========================
 def fetch_track(track: str,
                 keywords: List[str],
                 max_entries_per_feed: int,
@@ -373,11 +355,15 @@ def fetch_track(track: str,
         "entries_seen": 0,
         "hint_drop": 0,
         "no_date_drop": 0,
+        "too_old_drop": 0,
         "window_drop": 0,
         "added": 0,
     }
 
     found: Dict[str, Dict] = {}
+
+    # ✅ 안전장치: start_dt보다 1일 이전은 무조건 드랍 (2010 같은 이상치 차단)
+    hard_old_cutoff = start_dt - timedelta(days=1)
 
     for kw in keywords:
         q = query_builder(kw, TARGET_SITES, after_date, before_date)
@@ -407,13 +393,14 @@ def fetch_track(track: str,
                     stats["hint_drop"] += 1
                     continue
 
-                pub = _parse_published(e)
-                if not pub:
+                pub_kst = parse_entry_datetime_kst(e)
+                if not pub_kst:
                     stats["no_date_drop"] += 1
                     continue
 
-                # pub을 KST로 해석(정확한 TZ가 없어서 운영상 일관성을 택함)
-                pub_kst = pub.replace(tzinfo=KST)
+                if pub_kst < hard_old_cutoff:
+                    stats["too_old_drop"] += 1
+                    continue
 
                 if pub_kst < start_dt or pub_kst > end_dt:
                     stats["window_drop"] += 1
@@ -430,7 +417,7 @@ def fetch_track(track: str,
                     "press": press,
                     "title": title,
                     "google_link": google_link,
-                    "link": None,  # 원문으로 나중에 채움
+                    "link": None,
                     "published_dt": pub_kst,
                     "published": pub_kst.strftime("%Y-%m-%d %H:%M"),
                     "snippet": snippet,
@@ -445,10 +432,6 @@ def fetch_track(track: str,
     items = sorted(found.values(), key=lambda a: a["published_dt"], reverse=True)
     return items, stats
 
-# ==========================
-# 원문 링크로 변환 + 기사 URL 필터 적용
-# - 실패하면 drop (google 링크는 슬랙으로 보내지 않음)
-# ==========================
 def finalize_items(items: List[Dict], resolver: UrlResolver, budget: int) -> Tuple[List[Dict], Dict[str, int]]:
     stats = {"resolved_ok": 0, "resolve_fail_drop": 0, "non_article_url_drop": 0}
     out: List[Dict] = []
@@ -456,7 +439,6 @@ def finalize_items(items: List[Dict], resolver: UrlResolver, budget: int) -> Tup
 
     for a in items:
         if used >= budget:
-            # 예산 초과: 안전을 위해 drop (google 링크 남는 걸 허용하지 않음)
             stats["resolve_fail_drop"] += 1
             continue
 
@@ -467,12 +449,6 @@ def finalize_items(items: List[Dict], resolver: UrlResolver, budget: int) -> Tup
             stats["resolve_fail_drop"] += 1
             continue
 
-        # URL 정리(가끔 url= 인코딩된 형태가 섞이면 복호화)
-        try:
-            pub_url = unquote(pub_url)
-        except Exception:
-            pass
-
         if not is_valid_article_url(pub_url):
             stats["non_article_url_drop"] += 1
             continue
@@ -481,7 +457,6 @@ def finalize_items(items: List[Dict], resolver: UrlResolver, budget: int) -> Tup
         stats["resolved_ok"] += 1
         out.append(a)
 
-    # 링크 기준 중복 제거
     dedup: Dict[str, Dict] = {}
     for a in out:
         sid = _stable_id(a["title"], a["link"])
@@ -490,9 +465,6 @@ def finalize_items(items: List[Dict], resolver: UrlResolver, budget: int) -> Tup
     final = sorted(dedup.values(), key=lambda x: x["published_dt"], reverse=True)
     return final, stats
 
-# ==========================
-# Slack 메시지
-# ==========================
 def build_messages(window_label: str,
                    general: List[Dict], nexon: List[Dict],
                    stats: Dict[str, Dict]) -> List[str]:
@@ -500,16 +472,16 @@ def build_messages(window_label: str,
     header += (
         f"- general: feeds={stats['general_rss']['feeds_called']}, seen={stats['general_rss']['entries_seen']}, "
         f"added={stats['general_rss']['added']}, hint_drop={stats['general_rss']['hint_drop']}, "
-        f"no_date_drop={stats['general_rss']['no_date_drop']}, window_drop={stats['general_rss']['window_drop']}, "
-        f"resolved_ok={stats['general_final']['resolved_ok']}, resolve_fail_drop={stats['general_final']['resolve_fail_drop']}, "
-        f"url_drop={stats['general_final']['non_article_url_drop']}\n"
+        f"no_date_drop={stats['general_rss']['no_date_drop']}, too_old_drop={stats['general_rss']['too_old_drop']}, "
+        f"window_drop={stats['general_rss']['window_drop']}, resolved_ok={stats['general_final']['resolved_ok']}, "
+        f"resolve_fail_drop={stats['general_final']['resolve_fail_drop']}, url_drop={stats['general_final']['non_article_url_drop']}\n"
     )
     header += (
         f"- nexon: feeds={stats['nexon_rss']['feeds_called']}, seen={stats['nexon_rss']['entries_seen']}, "
         f"added={stats['nexon_rss']['added']}, hint_drop={stats['nexon_rss']['hint_drop']}, "
-        f"no_date_drop={stats['nexon_rss']['no_date_drop']}, window_drop={stats['nexon_rss']['window_drop']}, "
-        f"resolved_ok={stats['nexon_final']['resolved_ok']}, resolve_fail_drop={stats['nexon_final']['resolve_fail_drop']}, "
-        f"url_drop={stats['nexon_final']['non_article_url_drop']}\n\n"
+        f"no_date_drop={stats['nexon_rss']['no_date_drop']}, too_old_drop={stats['nexon_rss']['too_old_drop']}, "
+        f"window_drop={stats['nexon_rss']['window_drop']}, resolved_ok={stats['nexon_final']['resolved_ok']}, "
+        f"resolve_fail_drop={stats['nexon_final']['resolve_fail_drop']}, url_drop={stats['nexon_final']['non_article_url_drop']}\n\n"
     )
 
     def fmt(a: Dict) -> str:
@@ -535,7 +507,6 @@ def build_messages(window_label: str,
 
     full = header + body
 
-    # Slack 길이 분할
     messages: List[str] = []
     chunk = ""
     for line in full.splitlines(True):
@@ -545,7 +516,6 @@ def build_messages(window_label: str,
         chunk += line
     if chunk.strip():
         messages.append(chunk)
-
     return messages
 
 def send_to_slack(message: str) -> None:
@@ -560,49 +530,27 @@ def send_to_slack(message: str) -> None:
     )
     resp.raise_for_status()
 
-# ==========================
-# Main
-# ==========================
 def main() -> None:
     now_kst = datetime.now(KST)
     start_dt, end_dt, window_label = compute_window_kst(now_kst)
 
-    # 쿼리용 after/before 날짜(시간은 쿼리로 못 넣으므로 넉넉히 날짜로 잡음)
     after_date = start_dt.date().isoformat()
-    before_date = (end_dt.date() + timedelta(days=1)).isoformat()  # end일 포함시키기 위해 +1
+    before_date = (end_dt.date() + timedelta(days=1)).isoformat()
 
     general_keywords = PRIMARY_KEYWORDS[:KEYWORD_BATCH_PRIMARY]
     general_raw, stats_general_rss = fetch_track(
-        track="general",
-        keywords=general_keywords,
-        max_entries_per_feed=MAX_ENTRIES_PER_FEED,
-        query_builder=build_query_general,
-        after_date=after_date,
-        before_date=before_date,
-        start_dt=start_dt,
-        end_dt=end_dt,
+        "general", general_keywords, MAX_ENTRIES_PER_FEED,
+        build_query_general, after_date, before_date, start_dt, end_dt
     )
     if len(general_raw) < 10:
         general_raw, stats_general_rss = fetch_track(
-            track="general",
-            keywords=PRIMARY_KEYWORDS[:KEYWORD_BATCH_FALLBACK],
-            max_entries_per_feed=MAX_ENTRIES_PER_FEED,
-            query_builder=build_query_general,
-            after_date=after_date,
-            before_date=before_date,
-            start_dt=start_dt,
-            end_dt=end_dt,
+            "general", PRIMARY_KEYWORDS[:KEYWORD_BATCH_FALLBACK], MAX_ENTRIES_PER_FEED,
+            build_query_general, after_date, before_date, start_dt, end_dt
         )
 
     nexon_raw, stats_nexon_rss = fetch_track(
-        track="nexon",
-        keywords=PRIMARY_KEYWORDS,
-        max_entries_per_feed=MAX_ENTRIES_PER_NEXON_FEED,
-        query_builder=build_query_nexon,
-        after_date=after_date,
-        before_date=before_date,
-        start_dt=start_dt,
-        end_dt=end_dt,
+        "nexon", PRIMARY_KEYWORDS, MAX_ENTRIES_PER_NEXON_FEED,
+        build_query_nexon, after_date, before_date, start_dt, end_dt
     )
 
     resolver = UrlResolver()
@@ -615,10 +563,10 @@ def main() -> None:
 
     print("[INFO] preview general:")
     for i, a in enumerate(general_final[:PREVIEW_TOP_N], 1):
-        print(f"  {i:02d}. {a['title']} :: {a['link']}")
+        print(f"  {i:02d}. {a['published']} {a['title']} :: {a['link']}")
     print("[INFO] preview nexon:")
     for i, a in enumerate(nexon_final[:PREVIEW_TOP_N], 1):
-        print(f"  {i:02d}. {a['title']} :: {a['link']}")
+        print(f"  {i:02d}. {a['published']} {a['title']} :: {a['link']}")
 
     stats = {
         "general_rss": stats_general_rss,
