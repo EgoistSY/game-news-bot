@@ -1,13 +1,15 @@
 # ------------------------------------------------------------------
-# [운영용 v4.4.0] FAST Google News RSS -> Slack Digest
+# [운영용 v4.4] 정확 링크 + 기사 아닌 게시물 제거 (경량)
 # - Python 3.9 호환
-# - v4.4.0 개선사항:
-#   1) get_canonical_link(): Google 중간 링크에서 원문 URL 실제 디코딩
-#      -> 추가 HTTP 요청 없이 URL 파라미터(url=) 파싱으로 원문 추출
-#   2) is_valid_article_url() 인벤 필터 대폭 강화
-#      -> /webzine/news?news=숫자 패턴만 허용
-#   3) 비기사 제목 패턴 필터 추가
-#      -> 가이드, 모집, 스포주의, LCK 경기결과(승/패) 등 제목 기반 차단
+# - 목표:
+#   1) Slack에 보내는 링크는 "원문 URL"만 (Google 중간 링크 제거)
+#   2) Inven board/ 공략/ 길드모집/ keyword 리스트 페이지 제거
+#   3) 매일 KST 10시에 "전날" 기사만 발송되도록 after/before 날짜 범위 고정
+#
+# 핵심:
+# - RSS 수집은 빠르게 (feedparser)
+# - 원문 URL은 "보낼 기사 상위 N개만" 리다이렉트 해제(HEAD/GET stream) -> 경량 유지
+# - 본문 크롤링/파싱 없음
 # ------------------------------------------------------------------
 import os
 import re
@@ -16,15 +18,16 @@ import time
 import hashlib
 import random
 from typing import Dict, List, Optional, Tuple
-from datetime import datetime, timedelta, date
-from urllib.parse import quote, urlparse, parse_qs, unquote
+from datetime import datetime, timedelta
+from urllib.parse import quote, urlparse, parse_qs
 
 import requests
 import feedparser
-
-# Python 3.9 zoneinfo
 from zoneinfo import ZoneInfo
 
+# ==========================
+# 설정
+# ==========================
 SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL")
 
 TARGET_SITES = [
@@ -42,26 +45,32 @@ PRIMARY_KEYWORDS = [
     "매출", "순위", "소송", "규제", "CBT", "OBT", "인수", "투자", "M&A"
 ]
 
-SEARCH_DAYS = 1
+# 전날 범위로 고정 (KST)
+KST = ZoneInfo("Asia/Seoul")
 
-KEYWORD_BATCH_PRIMARY = 10
-KEYWORD_BATCH_FALLBACK = 18
+REQUEST_TIMEOUT = 10
+USER_AGENT = "Mozilla/5.0 (GameNewsBot/1.4; SlackWebhook)"
+SLEEP_BETWEEN_FEEDS = (0.05, 0.12)
 
 MAX_ENTRIES_PER_FEED = 30
 MAX_ENTRIES_PER_NEXON_FEED = 20
 
-REQUEST_TIMEOUT = 12
-USER_AGENT = "Mozilla/5.0 (FastNewsDigestBot/1.32; SlackWebhook)"
-SLEEP_BETWEEN_FEEDS = (0.05, 0.12)
+# Slack 출력 상한(너무 많으면 노이즈)
+GENERAL_SEND_LIMIT = 50
+NEXON_SEND_LIMIT = 5
+
+# 리다이렉트 해제는 "보낼 기사" + 백필용 일부만 수행 (경량)
+RESOLVE_BUDGET_GENERAL = 80   # 일반 기사 URL 해제 최대 개수
+RESOLVE_BUDGET_NEXON = 30     # 넥슨 URL 해제 최대 개수
 
 SLACK_TEXT_LIMIT = 3500
 TITLE_MAX = 120
 SNIPPET_MAX = 180
 PREVIEW_TOP_N = 12
 
-# --------------------------
+# ==========================
 # 컨텍스트/필터
-# --------------------------
+# ==========================
 GAME_CONTEXT_OR = [
     "게임", "게이밍", "게임업계", "게임사", "퍼블리셔", "개발사",
     "모바일게임", "PC게임", "콘솔", "스팀", "Steam", "PS5", "플레이스테이션", "닌텐도", "Xbox",
@@ -69,167 +78,73 @@ GAME_CONTEXT_OR = [
 ]
 GAME_CONTEXT_QUERY = "(" + " OR ".join(GAME_CONTEXT_OR) + ")"
 
-STRICT_SITES = {"zdnet.co.kr", "ddaily.co.kr"}
-
-GAME_HINTS = [
-    "게임", "게이밍", "신작", "업데이트", "출시", "스팀", "콘솔", "모바일", "PC",
-    "플레이스테이션", "닌텐도", "Xbox", "RPG", "MMORPG", "FPS", "MOBA",
-    "e스포츠", "esports",
-    "넥슨", "엔씨", "크래프톤", "넷마블", "카카오게임", "스마일게이트", "펄어비스",
+# 게시글/커뮤니티성(공략/길드모집 등) 1차 컷: 제목/요약 기반
+NON_ARTICLE_TITLE_HINTS = [
+    "공략", "팁", "노하우", "질문", "Q&A", "인증", "후기", "스샷", "스크린샷",
+    "길드", "길드모집", "모집", "파티", "팟", "고정팟", "클랜", "클랜모집",
+    "거래", "나눔", "판매", "삽니다",
+    "버그제보", "건의", "토론",
 ]
 
-NEXON_TERMS = [
-    "넥슨", "nexon",
-    "넥슨코리아", "넥슨게임즈", "넥슨 네트웍스", "넥슨네트웍스",
-    "네오플", "넥슨GT", "넥슨지티",
-]
-
-NEXON_IMPORTANCE = [
-    ("M&A", 5), ("인수", 5), ("합병", 5),
-    ("투자", 4), ("지분", 4),
-    ("소송", 5), ("규제", 4),
-    ("매출", 4), ("실적", 4), ("영업이익", 4), ("순이익", 4),
-    ("출시", 3), ("업데이트", 3),
-    ("CBT", 2), ("OBT", 2),
-    ("리스크", 3), ("악재", 3), ("호재", 3),
-]
-
-# --------------------------
-# ✅ 비기사 제목 패턴 필터
-#    아래 정규식 중 하나라도 매칭되면 제목 기반으로 기사를 걸러냄
-# --------------------------
-NON_ARTICLE_TITLE_PATTERNS = [
-    # 인벤 게시판 유형
-    re.compile(r"^\[모집\]"),          # 길드/파티 모집
-    re.compile(r"^\(스포주의\)"),       # 스포일러 포함 커뮤니티 글
-    re.compile(r"^웹진\s*$"),           # 단순 "웹진" 제목
-    # e스포츠 경기 결과 단신 (업계 뉴스 목적에 불필요)
-    re.compile(r"\[LCK"),              # LCK 경기 관련
-    re.compile(r"\[롤챔스\]"),
-    re.compile(r"\[오버워치\s*리그\]"),
-    # 커뮤니티성 가이드/공략
-    re.compile(r"가이드\s*\d+\.?\d*v"),  # "키세팅 설정 가이드 1.0v" 등
-    re.compile(r"^\[공략\]"),
-]
-
-def has_non_article_title(title: str) -> bool:
-    """제목이 비기사 패턴에 해당하면 True"""
-    for pat in NON_ARTICLE_TITLE_PATTERNS:
-        if pat.search(title):
-            return True
-    return False
-
-
-# --------------------------
-# ✅ 핵심 수정: 원문 URL 추출 (추가 HTTP 요청 없음)
-# --------------------------
-def get_canonical_link(entry) -> str:
-    """
-    Google News RSS entry.link는 보통 아래 두 형태 중 하나:
-      A) https://news.google.com/rss/articles/...  (불투명 ID)
-      B) https://news.google.com/articles/...?hl=...
-      C) 일부 feedparser 버전에서 entry.source 에 원문 URL 제공
-
-    우선순위:
-      1) entry.links 중 type이 text/html 이고 Google 도메인이 아닌 것
-      2) entry.source 의 href/url
-      3) entry.link 의 쿼리스트링에서 url= / q= 파라미터 파싱
-      4) entry.link 원본 (fallback)
-    """
-    # 1) entry.links 순회 — Google 도메인이 아닌 첫 번째 링크
-    try:
-        links = getattr(entry, "links", []) or []
-        for lk in links:
-            href = _clean_text(lk.get("href", "") if isinstance(lk, dict) else getattr(lk, "href", ""))
-            if href and "google.com" not in href:
-                return href
-    except Exception:
-        pass
-
-    # 2) entry.source 의 href / url
-    try:
-        src = getattr(entry, "source", None)
-        if src:
-            for k in ("href", "url"):
-                val = (_clean_text(src.get(k, "")) if isinstance(src, dict)
-                       else _clean_text(getattr(src, k, "") or ""))
-                if val and "google.com" not in val:
-                    return val
-    except Exception:
-        pass
-
-    # 3) entry.link 쿼리스트링에서 원문 URL 파라미터 시도
-    raw_link = _clean_text(getattr(entry, "link", "") or "")
-    if raw_link:
-        try:
-            p = urlparse(raw_link)
-            qs = parse_qs(p.query or "")
-            for param in ("url", "q", "u"):
-                vals = qs.get(param, [])
-                if vals:
-                    decoded = unquote(vals[0])
-                    if decoded.startswith("http") and "google.com" not in decoded:
-                        return decoded
-        except Exception:
-            pass
-
-    # 4) fallback: entry.link 그대로 (Google 중간 링크일 수 있음)
-    return raw_link
-
-
-# --------------------------
-# ✅ 강화된 URL 필터 (원문 URL 기준)
-# --------------------------
+# Inven URL 패턴 필터(원문 URL 기준으로만 적용)
 def is_valid_article_url(url: str) -> bool:
     if not url:
         return False
-
     try:
         p = urlparse(url)
         host = (p.netloc or "").lower()
         path = (p.path or "").lower()
         qs = parse_qs(p.query or "")
     except Exception:
-        return True
+        return True  # 파싱 실패는 과하게 버리기보다 통과
 
-    # Google 중간 링크는 원문 URL이 아니므로 원칙적으로 걸러냄
-    # (fallback으로 남은 경우 통과시켜 나중에 제목 필터에서 처리)
-    if "news.google.com" in host:
-        # 판단 불가 — 일단 통과시키되 로그 남김 (원문 추출 실패 케이스)
-        return True
-
-    # 공통 비기사 경로
-    common_bad_tokens = [
-        "/board/",
-        "/search",
-        "/tag/",
-        "/ranking", "/rank",
-        "/gallery",
-        "/forum/",
-        "/community/",
-    ]
-    if any(tok in path for tok in common_bad_tokens):
-        return False
-
-    # ✅ Inven 특화 — 뉴스 기사 URL만 허용
+    # 인벤: board는 기사 아님, keyword 리스트도 기사 아님
     if host.endswith("inven.co.kr"):
-        # 허용 패턴: /webzine/news?news=숫자 (실제 기사)
-        #   예) https://www.inven.co.kr/webzine/news/?news=298765
-        if path.rstrip("/") == "/webzine/news" or path.startswith("/webzine/news"):
-            news_ids = qs.get("news", [])
-            if news_ids and re.match(r"^\d+$", news_ids[0]):
-                return True  # 정상 기사
-            else:
-                return False  # 키워드 목록, 웹진 메인 등
-        # 그 외 inven 경로는 모두 차단 (게시판, 갤러리 등)
-        return False
+        if "/board/" in path:
+            return False
+        if path.startswith("/webzine/news") or path.startswith("/webzine/news/"):
+            # 기사면 news=가 있어야 함
+            if "news" not in qs:
+                return False
+        # news 없이 keyword만 있는 리스트 페이지 제거
+        if "keyword" in qs and "news" not in qs:
+            return False
 
     return True
 
+# 넥슨 검증(제목/요약에 넥슨이 실제 포함되어야만 넥슨 섹션에 포함)
+NEXON_TERMS = [
+    "넥슨", "nexon",
+    "넥슨코리아", "넥슨게임즈", "넥슨네트웍스", "네오플"
+]
 
-# --------------------------
+def contains_nexon(title: str, snippet: str) -> bool:
+    blob = f"{title} {snippet}".lower()
+    return any(t.lower() in blob for t in NEXON_TERMS)
+
+# 넥슨 중요도(가벼운 점수)
+NEXON_IMPORTANCE = [
+    ("M&A", 5), ("인수", 5), ("합병", 5),
+    ("투자", 4), ("지분", 4),
+    ("소송", 5), ("규제", 4),
+    ("매출", 4), ("실적", 4), ("영업이익", 4), ("순이익", 4),
+    ("출시", 3), ("업데이트", 3),
+    ("리스크", 3), ("악재", 3), ("호재", 3),
+]
+
+def nexon_score(a: Dict) -> int:
+    blob = f"{a.get('title','')} {a.get('snippet','')}".lower()
+    score = 0
+    for kw, w in NEXON_IMPORTANCE:
+        if kw.lower() in blob:
+            score += w
+    if contains_nexon(a.get("title",""), a.get("snippet","")):
+        score += 2
+    return score
+
+# ==========================
 # 유틸
-# --------------------------
+# ==========================
 def _clean_text(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip())
 
@@ -239,9 +154,6 @@ def _strip_html(s: str) -> str:
 def _truncate(s: str, n: int) -> str:
     s = s or ""
     return s if len(s) <= n else s[: max(0, n - 1)] + "…"
-
-def _sleep():
-    time.sleep(random.uniform(*SLEEP_BETWEEN_FEEDS))
 
 def _stable_id(title: str, link: str) -> str:
     return hashlib.sha1((title + "||" + link).encode("utf-8")).hexdigest()[:16]
@@ -255,12 +167,17 @@ def _parse_published(entry) -> Optional[datetime]:
     except Exception:
         return None
 
-def _within_days(dt: Optional[datetime], days: int) -> bool:
-    if not dt:
-        return True
-    return dt >= (datetime.now() - timedelta(days=days))
+def _sleep():
+    time.sleep(random.uniform(*SLEEP_BETWEEN_FEEDS))
+
+def _google_news_rss_search_url(query: str) -> str:
+    return "https://news.google.com/rss/search?q=" + quote(query) + "&hl=ko&gl=KR&ceid=KR:ko"
+
+def _site_or_query(sites: List[str]) -> str:
+    return "(" + " OR ".join([f"site:{s}" for s in sites]) + ")"
 
 def _press_guess(entry) -> str:
+    # Google News RSS는 source.title로 언론사 이름이 들어오는 경우가 많음(표시용)
     try:
         src = getattr(entry, "source", None)
         if src and isinstance(src, dict):
@@ -271,129 +188,98 @@ def _press_guess(entry) -> str:
         pass
     return "NEWS"
 
-def _google_news_rss_search_url(query: str) -> str:
-    return "https://news.google.com/rss/search?q=" + quote(query) + "&hl=ko&gl=KR&ceid=KR:ko"
-
-def _site_or_query(sites: List[str]) -> str:
-    return "(" + " OR ".join([f"site:{s}" for s in sites]) + ")"
-
-def _has_any_hint(text: str, hints: List[str]) -> bool:
-    blob = (text or "").lower()
-    return any(h.lower() in blob for h in hints)
-
-def contains_nexon(title: str, snippet: str) -> bool:
-    blob = f"{title} {snippet}".lower()
-    return any(t.lower() in blob for t in NEXON_TERMS)
-
-def nexon_score(article: Dict) -> int:
-    blob = f"{article.get('title','')} {article.get('snippet','')}".lower()
-    score = 0
-    for kw, w in NEXON_IMPORTANCE:
-        if kw.lower() in blob:
-            score += w
-    if contains_nexon(article.get("title", ""), article.get("snippet", "")):
-        score += 2
-    return score
-
-# --------------------------
-# 전날(KST) 날짜 범위
-# --------------------------
-def yesterday_range_kst() -> Tuple[str, str, str]:
-    tz = ZoneInfo("Asia/Seoul")
-    now = datetime.now(tz)
+def _yesterday_range_kst() -> Tuple[str, str, str]:
+    now = datetime.now(KST)
     today = now.date()
     yday = today - timedelta(days=1)
-    return (yday.isoformat(), yday.isoformat(), today.isoformat())
+    # Google search operator: after/before는 날짜 문자열 사용
+    return yday.isoformat(), yday.isoformat(), today.isoformat()
 
-# --------------------------
-# 쿼리
-# --------------------------
+def _looks_like_non_article(title: str, snippet: str) -> bool:
+    blob = f"{title} {snippet}".lower()
+    return any(h.lower() in blob for h in NON_ARTICLE_TITLE_HINTS)
+
+# ==========================
+# 핵심: Google 중간 링크 -> 원문 URL 해제 (경량)
+# - HEAD 시도 -> 막히면 GET stream (본문 다운로드 없음)
+# - 캐시로 중복 해제 방지
+# ==========================
+class UrlResolver:
+    def __init__(self):
+        self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": USER_AGENT,
+            "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.6",
+        })
+        self.cache: Dict[str, str] = {}
+
+    def resolve(self, url: str) -> str:
+        if not url:
+            return url
+        if url in self.cache:
+            return self.cache[url]
+
+        final_url = url
+        try:
+            # 1) HEAD allow_redirects
+            r = self.session.head(url, allow_redirects=True, timeout=REQUEST_TIMEOUT)
+            if r.url:
+                final_url = r.url
+        except Exception:
+            # 2) fallback: GET stream (본문 다운로드 없이)
+            try:
+                r = self.session.get(url, allow_redirects=True, timeout=REQUEST_TIMEOUT, stream=True)
+                if r.url:
+                    final_url = r.url
+                try:
+                    r.close()
+                except Exception:
+                    pass
+            except Exception:
+                final_url = url
+
+        self.cache[url] = final_url
+        return final_url
+
+# ==========================
+# 쿼리 빌더
+# ==========================
 def build_query_general(keyword: str, sites: List[str], after: str, before: str) -> str:
-    if sites:
-        return f"{GAME_CONTEXT_QUERY} {keyword} {_site_or_query(sites)} after:{after} before:{before}"
-    return f"{GAME_CONTEXT_QUERY} {keyword} after:{after} before:{before}"
+    # 전날 고정 after/before
+    return f"{GAME_CONTEXT_QUERY} {keyword} {_site_or_query(sites)} after:{after} before:{before}"
 
 def build_query_nexon(keyword: str, sites: List[str], after: str, before: str) -> str:
+    # 넥슨은 키워드+넥슨 교집합
     nexon_expr = '("넥슨" OR Nexon OR "넥슨게임즈" OR 네오플)'
-    if sites:
-        return f'{nexon_expr} {keyword} {_site_or_query(sites)} after:{after} before:{before}'
-    return f'{nexon_expr} {keyword} after:{after} before:{before}'
+    return f'{nexon_expr} {keyword} {_site_or_query(sites)} after:{after} before:{before}'
 
-# --------------------------
-# RSS 수집 — 공통 엔트리 처리 로직
-# --------------------------
-def _process_entry(e, stats: Dict, track: str, kw: str) -> Optional[Dict]:
-    """
-    단일 RSS 엔트리를 파싱하여 기사 dict 반환.
-    필터에 걸리면 None 반환 + stats 업데이트.
-    """
-    title = _clean_text(getattr(e, "title", ""))
-    if not title:
-        return None
+# ==========================
+# RSS 수집 (링크는 아직 google link 상태로 저장)
+# ==========================
+def fetch_track(track: str,
+                keywords: List[str],
+                max_entries_per_feed: int,
+                query_builder,
+                after: str,
+                before: str) -> Tuple[List[Dict], Dict[str, int]]:
 
-    # ✅ 비기사 제목 패턴 필터
-    if has_non_article_title(title):
-        stats.setdefault("title_pattern_filtered_out", 0)
-        stats["title_pattern_filtered_out"] += 1
-        return None
-
-    # ✅ 원문 URL 추출
-    link = get_canonical_link(e)
-    if not link:
-        return None
-
-    # ✅ URL 기반 비기사 필터
-    if not is_valid_article_url(link):
-        stats["non_article_url_filtered_out"] += 1
-        return None
-
-    published_dt = _parse_published(e)
-    if not _within_days(published_dt, SEARCH_DAYS):
-        stats["date_filtered_out"] += 1
-        return None
-
-    snippet_raw = getattr(e, "summary", "") or getattr(e, "description", "") or ""
-    snippet = _truncate(_clean_text(_strip_html(snippet_raw)), SNIPPET_MAX)
-
-    # strict 사이트(zdnet, ddaily) — 게임 힌트 없으면 제외
-    if any(s in link for s in STRICT_SITES) or any(s in title for s in ("지디넷", "디지털데일리")):
-        if not _has_any_hint(f"{title} {snippet}", GAME_HINTS):
-            stats["strict_filtered_out"] = stats.get("strict_filtered_out", 0) + 1
-            return None
-
-    return {
-        "track": track,
-        "keyword": kw,
-        "press": _press_guess(e),
-        "title": _truncate(title, TITLE_MAX),
-        "link": link,
-        "published_dt": published_dt,
-        "published": published_dt.strftime("%Y-%m-%d %H:%M") if published_dt else "",
-        "snippet": snippet,
-    }
-
-
-def fetch_general(keywords: List[str], sites: List[str], after: str, before: str) -> Tuple[List[Dict], Dict[str, int]]:
     session = requests.Session()
     session.headers.update({
         "User-Agent": USER_AGENT,
         "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.6",
     })
 
-    stats: Dict[str, int] = {
+    stats = {
         "feeds_called": 0,
         "entries_seen": 0,
-        "date_filtered_out": 0,
-        "strict_filtered_out": 0,
-        "non_article_url_filtered_out": 0,
-        "title_pattern_filtered_out": 0,
+        "non_article_hint_drop": 0,
         "added": 0,
     }
 
-    articles: Dict[str, Dict] = {}
+    found: Dict[str, Dict] = {}
 
     for kw in keywords:
-        q = build_query_general(kw, sites, after, before)
+        q = query_builder(kw, TARGET_SITES, after, before)
         url = _google_news_rss_search_url(q)
 
         try:
@@ -402,109 +288,113 @@ def fetch_general(keywords: List[str], sites: List[str], after: str, before: str
             stats["feeds_called"] += 1
 
             feed = feedparser.parse(resp.text)
-            for e in feed.entries[:MAX_ENTRIES_PER_FEED]:
+            for e in feed.entries[:max_entries_per_feed]:
                 stats["entries_seen"] += 1
-                article = _process_entry(e, stats, "general", kw)
-                if article is None:
+
+                title = _clean_text(getattr(e, "title", ""))
+                if not title:
                     continue
 
-                sid = _stable_id(article["title"], article["link"])
-                if sid in articles:
+                google_link = _clean_text(getattr(e, "link", "") or "")
+                if not google_link:
                     continue
 
-                articles[sid] = article
+                snippet_raw = getattr(e, "summary", "") or getattr(e, "description", "") or ""
+                snippet = _truncate(_clean_text(_strip_html(snippet_raw)), SNIPPET_MAX)
+
+                # 1차: 제목/요약 기반으로 공략/길드모집 등 컷 (매우 가벼움)
+                if _looks_like_non_article(title, snippet):
+                    stats["non_article_hint_drop"] += 1
+                    continue
+
+                published_dt = _parse_published(e)
+                press = _press_guess(e)
+
+                sid = _stable_id(title, google_link)
+                if sid in found:
+                    continue
+
+                found[sid] = {
+                    "track": track,
+                    "keyword": kw,
+                    "press": press,
+                    "title": _truncate(title, TITLE_MAX),
+                    "google_link": google_link,   # 중간 링크
+                    "link": google_link,          # 최종적으로 원문으로 교체할 예정
+                    "published_dt": published_dt,
+                    "published": published_dt.strftime("%Y-%m-%d %H:%M") if published_dt else "",
+                    "snippet": snippet,
+                }
                 stats["added"] += 1
 
             _sleep()
         except Exception as ex:
-            print(f"[WARN] RSS call failed (general kw={kw}): {ex}")
+            print(f"[WARN] RSS call failed ({track} kw={kw}): {ex}")
             continue
 
-    def sort_key(x: Dict) -> datetime:
-        return x["published_dt"] if x.get("published_dt") else datetime.min
+    # 최신순 기본 정렬
+    def sort_key(a: Dict) -> datetime:
+        return a["published_dt"] if a.get("published_dt") else datetime.min
 
-    return sorted(list(articles.values()), key=sort_key, reverse=True), stats
+    items = sorted(list(found.values()), key=sort_key, reverse=True)
+    return items, stats
 
-
-def fetch_nexon(keywords: List[str], sites: List[str], after: str, before: str) -> Tuple[List[Dict], Dict[str, int]]:
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": USER_AGENT,
-        "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.6",
-    })
-
-    stats: Dict[str, int] = {
-        "feeds_called": 0,
-        "entries_seen": 0,
-        "date_filtered_out": 0,
-        "nexon_filtered_out": 0,
-        "non_article_url_filtered_out": 0,
-        "title_pattern_filtered_out": 0,
-        "added": 0,
+# ==========================
+# 링크 해제 + URL 패턴 필터 적용 + 백필
+# ==========================
+def finalize_links_and_filter(items: List[Dict], resolver: UrlResolver, budget: int) -> Tuple[List[Dict], Dict[str, int]]:
+    stats = {
+        "resolved": 0,
+        "url_pattern_drop": 0,
+        "resolve_failed_or_google_left": 0,
     }
 
-    articles: Dict[str, Dict] = {}
+    out: List[Dict] = []
+    used = 0
 
-    for kw in keywords:
-        q = build_query_nexon(kw, sites, after, before)
-        url = _google_news_rss_search_url(q)
-
-        try:
-            resp = session.get(url, timeout=REQUEST_TIMEOUT)
-            resp.raise_for_status()
-            stats["feeds_called"] += 1
-
-            feed = feedparser.parse(resp.text)
-            for e in feed.entries[:MAX_ENTRIES_PER_NEXON_FEED]:
-                stats["entries_seen"] += 1
-                article = _process_entry(e, stats, "nexon", kw)
-                if article is None:
-                    continue
-
-                # 넥슨 최종 검증 (제목/요약에 실제 넥슨 포함)
-                if not contains_nexon(article["title"], article["snippet"]):
-                    stats["nexon_filtered_out"] += 1
-                    continue
-
-                sid = _stable_id(article["title"], article["link"])
-                if sid in articles:
-                    continue
-
-                articles[sid] = article
-                stats["added"] += 1
-
-            _sleep()
-        except Exception as ex:
-            print(f"[WARN] RSS call failed (nexon kw={kw}): {ex}")
+    for a in items:
+        if used >= budget:
+            # 예산 넘으면 google 링크 그대로(단, 인벤 게시판 같은 걸 못 걸러서 위험)
+            # -> 예산은 SEND_LIMIT보다 여유 있게 잡아둠(위에서 80/30)
+            a["link"] = a["google_link"]
+            stats["resolve_failed_or_google_left"] += 1
+            out.append(a)
             continue
 
-    def sort_key(x: Dict) -> datetime:
-        return x["published_dt"] if x.get("published_dt") else datetime.min
+        g = a.get("google_link", "")
+        final = resolver.resolve(g)
+        used += 1
+        stats["resolved"] += 1
 
-    return sorted(list(articles.values()), key=sort_key, reverse=True), stats
+        a["link"] = final
 
+        # 원문 URL 패턴으로 "기사 아닌 링크" 확실하게 제거
+        if not is_valid_article_url(final):
+            stats["url_pattern_drop"] += 1
+            continue
 
-# --------------------------
+        out.append(a)
+
+    # 중복(원문 URL 기준)
+    dedup: Dict[str, Dict] = {}
+    for a in out:
+        sid = _stable_id(a.get("title",""), a.get("link",""))
+        dedup[sid] = a
+
+    # 다시 최신순 정렬
+    def sort_key(a: Dict) -> datetime:
+        return a["published_dt"] if a.get("published_dt") else datetime.min
+
+    return sorted(list(dedup.values()), key=sort_key, reverse=True), stats
+
+# ==========================
 # Slack 메시지
-# --------------------------
+# ==========================
 def build_messages(general: List[Dict], nexon: List[Dict],
-                   stats_g: Dict[str, int], stats_n: Dict[str, int],
-                   yday_label: str) -> List[str]:
+                   stats: Dict[str, Dict], yday_label: str) -> List[str]:
     header = f"## 📰 {yday_label} 전날 주요 게임업계 뉴스 브리핑 (발송: KST 10:00)\n"
-    header += (
-        f"- general: feeds={stats_g.get('feeds_called',0)}, "
-        f"entries={stats_g.get('entries_seen',0)}, added={stats_g.get('added',0)}, "
-        f"strict_drop={stats_g.get('strict_filtered_out',0)}, "
-        f"non_article_drop={stats_g.get('non_article_url_filtered_out',0)}, "
-        f"title_pat_drop={stats_g.get('title_pattern_filtered_out',0)}\n"
-    )
-    header += (
-        f"- nexon: feeds={stats_n.get('feeds_called',0)}, "
-        f"entries={stats_n.get('entries_seen',0)}, added={stats_n.get('added',0)}, "
-        f"nexon_drop={stats_n.get('nexon_filtered_out',0)}, "
-        f"non_article_drop={stats_n.get('non_article_url_filtered_out',0)}, "
-        f"title_pat_drop={stats_n.get('title_pattern_filtered_out',0)}\n\n"
-    )
+    header += f"- general: feeds={stats['general_rss']['feeds_called']}, entries={stats['general_rss']['entries_seen']}, rss_added={stats['general_rss']['added']}, hint_drop={stats['general_rss']['non_article_hint_drop']}, resolved={stats['general_finalize']['resolved']}, url_drop={stats['general_finalize']['url_pattern_drop']}\n"
+    header += f"- nexon: feeds={stats['nexon_rss']['feeds_called']}, entries={stats['nexon_rss']['entries_seen']}, rss_added={stats['nexon_rss']['added']}, hint_drop={stats['nexon_rss']['non_article_hint_drop']}, resolved={stats['nexon_finalize']['resolved']}, url_drop={stats['nexon_finalize']['url_pattern_drop']}\n\n"
 
     def fmt(a: Dict) -> str:
         pub = f" ({a['published']})" if a.get("published") else ""
@@ -515,23 +405,23 @@ def build_messages(general: List[Dict], nexon: List[Dict],
     if not general:
         body += "- 전날 기준 수집된 뉴스가 없습니다.\n"
     else:
-        for a in general[:70]:
+        for a in general[:GENERAL_SEND_LIMIT]:
             body += fmt(a)
 
+    # 넥슨: 정확도 강제(제목/요약 넥슨 포함) + 중요도 Top 5
+    nexon_true = [a for a in nexon if contains_nexon(a.get("title",""), a.get("snippet",""))]
+    nexon_sorted = sorted(nexon_true, key=lambda x: (nexon_score(x), x["published_dt"] or datetime.min), reverse=True)
+
     body += "\n---\n### 🏢 넥슨 관련 주요 뉴스 (Top 5)\n"
-    if not nexon:
-        body += "- 넥슨 관련 뉴스(키워드 교집합 + 제목/요약 검증)를 찾지 못했습니다.\n"
+    if not nexon_sorted:
+        body += "- 전날 기준 넥슨 관련 주요 뉴스를 찾지 못했습니다.\n"
     else:
-        scored = sorted(
-            nexon,
-            key=lambda x: (nexon_score(x), x["published_dt"] or datetime.min),
-            reverse=True
-        )
-        for a in scored[:5]:
+        for a in nexon_sorted[:NEXON_SEND_LIMIT]:
             body += fmt(a)
 
     full = header + body
 
+    # Slack 길이 분할
     messages: List[str] = []
     chunk = ""
     for line in full.splitlines(True):
@@ -541,10 +431,10 @@ def build_messages(general: List[Dict], nexon: List[Dict],
         chunk += line
     if chunk.strip():
         messages.append(chunk)
+
     return messages
 
-
-def send_to_slack_text(message: str) -> None:
+def send_to_slack(message: str) -> None:
     if not SLACK_WEBHOOK_URL:
         raise RuntimeError("환경변수 SLACK_WEBHOOK_URL이 설정되어 있지 않습니다.")
 
@@ -557,35 +447,72 @@ def send_to_slack_text(message: str) -> None:
     )
     resp.raise_for_status()
 
-
-# --------------------------
+# ==========================
 # Main
-# --------------------------
+# ==========================
 def main() -> None:
-    yday_label, after, before = yesterday_range_kst()
+    yday_label, after, before = _yesterday_range_kst()
 
-    general, stats_g = fetch_general(PRIMARY_KEYWORDS[:KEYWORD_BATCH_PRIMARY], TARGET_SITES, after, before)
-    if not general:
-        general, stats_g = fetch_general(PRIMARY_KEYWORDS[:KEYWORD_BATCH_FALLBACK], TARGET_SITES, after, before)
+    # 1) RSS로 후보 수집
+    general_keywords = PRIMARY_KEYWORDS[:KEYWORD_BATCH_PRIMARY]
+    general_items, stats_general_rss = fetch_track(
+        track="general",
+        keywords=general_keywords,
+        max_entries_per_feed=MAX_ENTRIES_PER_FEED,
+        query_builder=build_query_general,
+        after=after,
+        before=before,
+    )
+    # 너무 적으면 키워드 확장
+    if len(general_items) < 10:
+        general_items, stats_general_rss = fetch_track(
+            track="general",
+            keywords=PRIMARY_KEYWORDS[:KEYWORD_BATCH_FALLBACK],
+            max_entries_per_feed=MAX_ENTRIES_PER_FEED,
+            query_builder=build_query_general,
+            after=after,
+            before=before,
+        )
 
-    nexon, stats_n = fetch_nexon(PRIMARY_KEYWORDS, TARGET_SITES, after, before)
+    nexon_items, stats_nexon_rss = fetch_track(
+        track="nexon",
+        keywords=PRIMARY_KEYWORDS,
+        max_entries_per_feed=MAX_ENTRIES_PER_NEXON_FEED,
+        query_builder=build_query_nexon,
+        after=after,
+        before=before,
+    )
 
-    print(f"[INFO] date_range_kst: after={after}, before={before} (yday={yday_label})")
-    print(f"[INFO] general fetched: {len(general)}, stats: {stats_g}")
-    print(f"[INFO] nexon fetched: {len(nexon)}, stats: {stats_n}")
+    # 2) "보낼 만큼만" 리다이렉트 해제해서 원문 URL 확정 + URL 패턴 필터
+    resolver = UrlResolver()
+    general_final, stats_general_finalize = finalize_links_and_filter(general_items, resolver, RESOLVE_BUDGET_GENERAL)
+    nexon_final, stats_nexon_finalize = finalize_links_and_filter(nexon_items, resolver, RESOLVE_BUDGET_NEXON)
+
+    # 3) 디버그 미리보기(액션 로그용)
+    print(f"[INFO] KST range: after={after} before={before} (yday={yday_label})")
+    print(f"[INFO] general rss={len(general_items)} final={len(general_final)}")
+    print(f"[INFO] nexon rss={len(nexon_items)} final={len(nexon_final)}")
+
     print("[INFO] preview general:")
-    for i, a in enumerate(general[:PREVIEW_TOP_N], 1):
-        print(f"  {i:02d}. [{a.get('press','NEWS')}] {a.get('title','')} :: {a.get('link','')}")
+    for i, a in enumerate(general_final[:PREVIEW_TOP_N], 1):
+        print(f"  {i:02d}. {a.get('title','')} :: {a.get('link','')}")
     print("[INFO] preview nexon:")
-    for i, a in enumerate(nexon[:PREVIEW_TOP_N], 1):
-        print(f"  {i:02d}. [{a.get('press','NEWS')}] {a.get('title','')} :: {a.get('link','')}")
+    for i, a in enumerate(nexon_final[:PREVIEW_TOP_N], 1):
+        print(f"  {i:02d}. {a.get('title','')} :: {a.get('link','')}")
 
-    messages = build_messages(general, nexon, stats_g, stats_n, yday_label)
-    for i, msg in enumerate(messages, 1):
-        send_to_slack_text(msg)
-        print(f"[INFO] sent slack message {i}/{len(messages)}")
+    stats = {
+        "general_rss": stats_general_rss,
+        "nexon_rss": stats_nexon_rss,
+        "general_finalize": stats_general_finalize,
+        "nexon_finalize": stats_nexon_finalize,
+    }
+
+    # 4) Slack 전송
+    messages = build_messages(general_final, nexon_final, stats, yday_label)
+    for idx, msg in enumerate(messages, 1):
+        send_to_slack(msg)
+        print(f"[INFO] sent slack {idx}/{len(messages)}")
         time.sleep(0.15)
-
 
 if __name__ == "__main__":
     main()
