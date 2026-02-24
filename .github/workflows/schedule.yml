@@ -2,19 +2,42 @@ name: Daily Game News Scraper
 
 on:
   schedule:
-    # 분 0(정각) 피해서 드롭/지연 가능성 줄이기
+    # 10:02 KST (UTC 01:02), Mon-Fri
     - cron: '2-59/5 * * * *'
   workflow_dispatch:
+
+# 같은 워크플로가 겹쳐 돌면 Slack 중복 발송될 수 있어서 방지
+concurrency:
+  group: daily-game-news-scraper
+  cancel-in-progress: true
 
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - run: pip install -r requirements.txt
-      - run: python main.py
+          cache: 'pip'  # requirements.txt 기반 자동 캐시
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # 간헐적 네트워크/대상 사이트 이슈 대비 (최대 3회)
+      - name: Run scraper
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 12
+          max_attempts: 3
+          retry_wait_seconds: 20
+          command: python main.py
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
