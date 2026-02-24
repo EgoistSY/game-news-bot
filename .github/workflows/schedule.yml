@@ -1,0 +1,20 @@
+name: Daily Game News Scraper
+
+on:
+  schedule:
+    # 분 0(정각) 피해서 드롭/지연 가능성 줄이기
+    - cron: '2-59/5 * * * *'
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -r requirements.txt
+      - run: python main.py
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
