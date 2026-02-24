@@ -1,4 +1,4 @@
-name: Daily Game News Scraper
+name: Daily Game News Scraper 
 
 on:
   schedule:
