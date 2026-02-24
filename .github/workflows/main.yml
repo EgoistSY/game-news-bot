@@ -1,5 +1,5 @@
 # GitHub Actions 워크플로우 설정
-name: Daily Game News Scraper
+name: Daily Game News Scraper v2
 
 on:
   schedule:
