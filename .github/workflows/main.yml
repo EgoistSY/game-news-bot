@@ -3,7 +3,7 @@ name: Daily Game News Scraper
 
 on:
   schedule:
-    - cron: '* * * * *'
+    - cron: '*/5 * * * *'
   workflow_dispatch:
 
 jobs:
