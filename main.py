@@ -1,10 +1,15 @@
 # ------------------------------------------------------------------
-# [운영용 v5] "진짜 기사"만 + "진짜 원문 링크"만 + KST 10시 기준 전 영업일 윈도우
-# - Google News / googlesearch 완전 제거 (news.google.com 링크 원천 차단)
+# [운영용 v6]
+# - "진짜 기사"만 + "진짜 원문 링크"만
+# - Google News / googlesearch 완전 제거
 # - 인벤: RSS(FeedBurner) 사용
 # - 게임메카/게임플/게임톡: HTML 리스트에서 기사 URL 수집
 # - 기사 검증: (1) URL 패턴 (도메인별) + (2) 제목 힌트
-# - 기간: "전 영업일 00:00 ~ 오늘 09:59" (주말/공휴일 롤백)
+# - 기간: 최근 영업일 3일 00:00 ~ 최근 영업일 09:59:59
+# - 디버깅 로그 추가:
+#   * main 시작 시각
+#   * 소스별 fetch 시작/종료 시각
+#   * Slack 전송 시작/종료 시각
 #
 # requirements.txt:
 #   requests
@@ -32,12 +37,15 @@ from zoneinfo import ZoneInfo
 SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL")
 
 KST = ZoneInfo("Asia/Seoul")
-USER_AGENT = "Mozilla/5.0 (GameNewsBot/5.0; +https://github.com/)"
+UTC = ZoneInfo("UTC")
+USER_AGENT = "Mozilla/5.0 (GameNewsBot/6.0; +https://github.com/)"
 TIMEOUT = 12
 
 PRIMARY_KEYWORDS = [
     "신작", "성과", "호재", "악재", "리스크", "정책", "업데이트", "출시",
-    "매출", "순위", "소송", "규제", "CBT", "OBT", "인수", "투자", "M&A"
+    "매출", "순위", "소송", "규제", "CBT", "OBT", "인수", "투자", "M&A",
+    "서비스 종료", "종료", "공정위", "과태료", "제재", "행정처분",
+    "분쟁", "환불", "확률형", "표시광고", "제재금", "1위", "흥행"
 ]
 
 # Slack 출력 제한
@@ -64,22 +72,21 @@ NEXON_TERMS = ["넥슨", "nexon", "넥슨코리아", "넥슨게임즈", "네오�
 
 
 # ==========================
-# 2026 KR 공휴일 (하드코딩, 외부 라이브러리 불필요)
-# 출처: VisitKorea 2026 Public Holidays 표 기반
+# 2026 KR 공휴일 (하드코딩)
 # ==========================
 KR_HOLIDAYS_2026 = {
     date(2026, 1, 1),
-    date(2026, 2, 16), date(2026, 2, 17), date(2026, 2, 18),  # 설날
-    date(2026, 3, 1), date(2026, 3, 2),  # 삼일절(+대체)
-    date(2026, 5, 5),  # 어린이날
-    date(2026, 5, 24), date(2026, 5, 25),  # 부처님오신날(+대체)
-    date(2026, 6, 3),  # 지방선거
-    date(2026, 6, 6),  # 현충일
-    date(2026, 8, 15), date(2026, 8, 17),  # 광복절(+대체)
-    date(2026, 9, 24), date(2026, 9, 25), date(2026, 9, 26),  # 추석
-    date(2026, 10, 3), date(2026, 10, 5),  # 개천절(+대체)
-    date(2026, 10, 9),  # 한글날
-    date(2026, 12, 25),  # 성탄절
+    date(2026, 2, 16), date(2026, 2, 17), date(2026, 2, 18),
+    date(2026, 3, 1), date(2026, 3, 2),
+    date(2026, 5, 5),
+    date(2026, 5, 24), date(2026, 5, 25),
+    date(2026, 6, 3),
+    date(2026, 6, 6),
+    date(2026, 8, 15), date(2026, 8, 17),
+    date(2026, 9, 24), date(2026, 9, 25), date(2026, 9, 26),
+    date(2026, 10, 3), date(2026, 10, 5),
+    date(2026, 10, 9),
+    date(2026, 12, 25),
 }
 
 # ==========================
@@ -103,7 +110,6 @@ def contains_nexon(title: str, snippet: str) -> bool:
     return any(t.lower() in blob for t in NEXON_TERMS)
 
 def is_business_day(d: date) -> bool:
-    # 월(0)~금(4) and not holiday
     if d.weekday() >= 5:
         return False
     if d.year == 2026 and d in KR_HOLIDAYS_2026:
@@ -112,27 +118,32 @@ def is_business_day(d: date) -> bool:
 
 def compute_window(now_kst: datetime) -> Tuple[datetime, datetime]:
     """
-    실행 시각이 (대체로) KST 10:00이라고 가정.
-    윈도우: 전 영업일 00:00 ~ 오늘 09:59:59
-    단, 오늘이 영업일이 아니면 오늘도 롤백해서 '마지막 영업일'의 다음날 09:59까지로 잡는다.
+    최근 영업일 3일 기준 윈도우
+    예:
+      - 월요일 실행 -> 목요일 00:00 ~ 월요일 09:59:59
+      - 공휴일/주말 실행 -> 가장 최근 영업일을 end 기준일로 삼음
     """
-    # 오늘 09:59:59 (KST)
-    end = now_kst.replace(hour=9, minute=59, second=59, microsecond=0)
-
-    # 오늘이 영업일이 아니면 end 자체를 "영업일 다음날 09:59"로 맞추기 위해
-    # now_kst의 날짜를 영업일이 될 때까지 뒤로 민다.
     base_day = now_kst.date()
     while not is_business_day(base_day):
         base_day = base_day - timedelta(days=1)
 
-    # end를 base_day의 "다음날 09:59"로 보정 (즉, base_day 커버 끝)
-    end = datetime(base_day.year, base_day.month, base_day.day, 9, 59, 59, tzinfo=KST)
-    # 전 영업일 찾기
-    prev_bd = base_day - timedelta(days=1)
-    while not is_business_day(prev_bd):
-        prev_bd = prev_bd - timedelta(days=1)
+    business_days = [base_day]
+    cursor = base_day
+    while len(business_days) < 3:
+        cursor = cursor - timedelta(days=1)
+        if is_business_day(cursor):
+            business_days.append(cursor)
 
-    start = datetime(prev_bd.year, prev_bd.month, prev_bd.day, 0, 0, 0, tzinfo=KST)
+    oldest_day = business_days[-1]
+
+    start = datetime(
+        oldest_day.year, oldest_day.month, oldest_day.day,
+        0, 0, 0, tzinfo=KST
+    )
+    end = datetime(
+        base_day.year, base_day.month, base_day.day,
+        9, 59, 59, tzinfo=KST
+    )
     return start, end
 
 def in_window(dt: Optional[datetime], start: datetime, end: datetime) -> bool:
@@ -150,6 +161,11 @@ def http_session() -> requests.Session:
     })
     return s
 
+def log_time(label: str) -> None:
+    now_kst = datetime.now(KST)
+    now_utc = datetime.now(UTC)
+    print(f"[TIME] {label} | KST={now_kst.isoformat()} | UTC={now_utc.isoformat()}")
+
 
 # ==========================
 # 도메인별 "진짜 기사 URL" 검증
@@ -163,37 +179,30 @@ def is_valid_article_url(url: str) -> bool:
     path = (p.path or "").lower()
     qs = parse_qs(p.query or "")
 
-    # Google / 외부 중간 링크 차단
     if "news.google.com" in host or "google.com" in host:
         return False
 
-    # Inven: /board/ 는 무조건 게시판
     if host.endswith("inven.co.kr"):
         if "/board/" in path:
             return False
-        # webzine news인데 news 파라미터 없는 검색/목록은 제외
         if path.startswith("/webzine/news"):
             if "news" not in qs:
                 return False
-        # keyword만 있는 페이지 제외
         if "keyword" in qs and "news" not in qs:
             return False
 
-    # Gameple: 기사 URL은 /news/articleView.html?idxno= 가 사실상 정답
     if host.endswith("gameple.co.kr"):
         if "/news/articleview.html" not in path:
             return False
         if "idxno" not in qs:
             return False
 
-    # Gametoc: 기사 URL은 /news/articleView.html?idxno=
     if host.endswith("gametoc.co.kr"):
         if "/news/articleview.html" not in path:
             return False
         if "idxno" not in qs:
             return False
 
-    # Gamemeca: 기사 URL은 /view.php?gid=...
     if host.endswith("gamemeca.com"):
         if "/view.php" not in path:
             return False
@@ -237,7 +246,6 @@ def fetch_inven_rss(start: datetime, end: datetime) -> List[Article]:
         if not title or not link:
             continue
 
-        # RSS에서 들어오는 link가 인벤 기사/뉴스가 아닐 수도 있어서 URL 필터
         if not is_valid_article_url(link):
             continue
 
@@ -247,7 +255,7 @@ def fetch_inven_rss(start: datetime, end: datetime) -> List[Article]:
         t = getattr(e, "published_parsed", None) or getattr(e, "updated_parsed", None)
         if not t:
             continue
-        pub = datetime(*t[:6], tzinfo=ZoneInfo("UTC")).astimezone(KST)
+        pub = datetime(*t[:6], tzinfo=UTC).astimezone(KST)
 
         if not in_window(pub, start, end):
             continue
@@ -312,7 +320,7 @@ def fetch_gamemeca_list(start: datetime, end: datetime) -> List[Article]:
 
 
 # ==========================
-# 수집기 3) 게임플 홈(HTML) → articleView 링크 추출 후 기사 페이지에서 입력시간 파싱
+# 수집기 3) 게임플 홈(HTML)
 # ==========================
 _GAMEPLE_LINK_RE = re.compile(r'href="(?P<href>/news/articleView\.html\?idxno=\d+)"')
 _GAMEPLE_TIME_RE = re.compile(r"입력\s*(\d{4}\.\d{2}\.\d{2})\s*(\d{2}:\d{2})")
@@ -331,7 +339,6 @@ def fetch_gameple(start: datetime, end: datetime) -> List[Article]:
         if not is_valid_article_url(url):
             continue
 
-        # 기사 페이지에서 시간/제목 확보
         try:
             rr = s.get(url, timeout=TIMEOUT)
             rr.raise_for_status()
@@ -339,13 +346,11 @@ def fetch_gameple(start: datetime, end: datetime) -> List[Article]:
         except Exception:
             continue
 
-        # 제목(og:title 우선)
         title = ""
         og = re.search(r'<meta[^>]+property="og:title"[^>]+content="([^"]+)"', art_html)
         if og:
             title = clean_text(og.group(1))
         if not title:
-            # h 태그 fallback
             h = re.search(r"<h\d[^>]*>([^<]+)</h\d>", art_html)
             if h:
                 title = clean_text(h.group(1))
@@ -372,13 +377,12 @@ def fetch_gameple(start: datetime, end: datetime) -> List[Article]:
             published=pub,
         ))
 
-        time.sleep(random.uniform(0.05, 0.12))  # 경량 예의상 슬립
+        time.sleep(random.uniform(0.05, 0.12))
     return out
 
 
 # ==========================
-# 수집기 4) 게임톡 리스트(HTML) → articleView 링크 추출 + 기사 페이지에서 입력시간 파싱
-# (403이 있을 수 있어 UA 헤더로 시도)
+# 수집기 4) 게임톡 리스트(HTML)
 # ==========================
 _GAMETOC_LINK_RE = re.compile(r'href="(?P<href>/news/articleView\.html\?idxno=\d+)"')
 _GAMETOC_TIME_RE = re.compile(r"입력\s*(\d{4}\.\d{2}\.\d{2})\s*(\d{2}:\d{2})")
@@ -448,8 +452,8 @@ def fetch_gametoc(start: datetime, end: datetime) -> List[Article]:
 def keyword_filter(articles: List[Article], keywords: List[str]) -> List[Article]:
     out = []
     for a in articles:
-        blob = (a.title or "")
-        if any(k.lower() in blob.lower() for k in keywords):
+        blob = f"{a.title} {a.snippet}".lower()
+        if any(k.lower() in blob for k in keywords):
             out.append(a)
     return out
 
@@ -458,7 +462,6 @@ def dedup(articles: List[Article]) -> List[Article]:
     for a in articles:
         sid = stable_id(a.title, a.url)
         seen[sid] = a
-    # 최신순
     return sorted(seen.values(), key=lambda x: x.published, reverse=True)
 
 def build_slack_message(general: List[Article], nexon: List[Article], start: datetime, end: datetime) -> List[str]:
@@ -487,7 +490,6 @@ def build_slack_message(general: List[Article], nexon: List[Article], start: dat
 
     full = header + body
 
-    # 슬랙 길이 분할
     msgs: List[str] = []
     chunk = ""
     for line in full.splitlines(True):
@@ -515,17 +517,21 @@ def send_to_slack(text: str) -> None:
 # Main
 # ==========================
 def main():
+    log_time("main_started")
+
     now = datetime.now(KST)
     start, end = compute_window(now)
 
+    print(f"[INFO] now_kst={now.isoformat()}")
     print(f"[INFO] window: {start} ~ {end} (KST)")
 
-    # 1) 소스별 수집
     collected: List[Article] = []
     stats = {}
 
     try:
+        log_time("fetch_inven_start")
         inv = fetch_inven_rss(start, end)
+        log_time("fetch_inven_end")
         stats["inven"] = len(inv)
         collected.extend(inv)
     except Exception as e:
@@ -533,7 +539,9 @@ def main():
         stats["inven"] = 0
 
     try:
+        log_time("fetch_gamemeca_start")
         gm = fetch_gamemeca_list(start, end)
+        log_time("fetch_gamemeca_end")
         stats["gamemeca"] = len(gm)
         collected.extend(gm)
     except Exception as e:
@@ -541,7 +549,9 @@ def main():
         stats["gamemeca"] = 0
 
     try:
+        log_time("fetch_gameple_start")
         gp = fetch_gameple(start, end)
+        log_time("fetch_gameple_end")
         stats["gameple"] = len(gp)
         collected.extend(gp)
     except Exception as e:
@@ -549,39 +559,44 @@ def main():
         stats["gameple"] = 0
 
     try:
+        log_time("fetch_gametoc_start")
         gt = fetch_gametoc(start, end)
+        log_time("fetch_gametoc_end")
         stats["gametoc"] = len(gt)
         collected.extend(gt)
     except Exception as e:
         print(f"[WARN] gametoc failed: {e}")
         stats["gametoc"] = 0
 
-    # 2) 키워드 필터(너가 원래 원했던 “게임업계 핵심 이슈”만 남김)
+    log_time("filter_start")
     filtered = keyword_filter(collected, PRIMARY_KEYWORDS)
-
-    # 3) URL 최종 검증 + 중복 제거
     filtered = [a for a in filtered if is_valid_article_url(a.url)]
     general = dedup(filtered)
 
-    # 4) 넥슨: “키워드 + 넥슨(정확매칭)” 교집합
     nexon_candidates = [a for a in general if contains_nexon(a.title, a.snippet)]
     nexon = dedup(nexon_candidates)
+    log_time("filter_end")
 
     print(f"[INFO] stats: {stats}")
-    print(f"[INFO] general={len(general)} nexon={len(nexon)}")
+    print(f"[INFO] collected={len(collected)} filtered={len(filtered)} general={len(general)} nexon={len(nexon)}")
+
     print("[INFO] preview general:")
     for a in general[:10]:
         print(" -", a.title, "::", a.url)
+
     print("[INFO] preview nexon:")
     for a in nexon[:10]:
         print(" -", a.title, "::", a.url)
 
-    # 5) Slack 전송
     msgs = build_slack_message(general, nexon, start, end)
+
+    log_time("slack_send_start")
     for i, m in enumerate(msgs, 1):
         send_to_slack(m)
         print(f"[INFO] sent slack {i}/{len(msgs)}")
         time.sleep(0.2)
+    log_time("slack_send_end")
+
 
 if __name__ == "__main__":
     main()
