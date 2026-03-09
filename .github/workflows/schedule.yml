@@ -1,8 +1,8 @@
-name: Daily Game News Scraper 
+name: Daily Game News Scraper
 
 on:
   schedule:
-    - cron: '2 1 * * 1-5'
+    - cron: '17 1 * * 1-5'   # 평일 10:17 KST
   workflow_dispatch:
 
 concurrency:
@@ -29,6 +29,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Print runner time before run
+        run: |
+          echo "UTC now:"
+          date -u
+          echo "KST now:"
+          TZ=Asia/Seoul date
+
       - name: Run scraper (retry)
         uses: nick-fields/retry@v3
         with:
@@ -38,3 +45,11 @@ jobs:
           command: python main.py
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+      - name: Print runner time after run
+        if: always()
+        run: |
+          echo "UTC end:"
+          date -u
+          echo "KST end:"
+          TZ=Asia/Seoul date
