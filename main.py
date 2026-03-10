@@ -1,5 +1,5 @@
 # ------------------------------------------------------------------
-# [운영용 v6]
+# [운영용 v7]
 # - "진짜 기사"만 + "진짜 원문 링크"만
 # - Google News / googlesearch 완전 제거
 # - 인벤: RSS(FeedBurner) 사용
@@ -10,6 +10,12 @@
 #   * main 시작 시각
 #   * 소스별 fetch 시작/종료 시각
 #   * Slack 전송 시작/종료 시각
+# - 키워드 확장:
+#   * AI / IT / 게임업계 / 주요 타이틀 / 주요 기업
+# - 넥슨 관련 기사 분류 개선:
+#   * title + snippet 기반
+#   * 점수 기반 관련도 산정
+#   * 관련도 + 최신순 정렬
 #
 # requirements.txt:
 #   requests
@@ -38,14 +44,41 @@ SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL")
 
 KST = ZoneInfo("Asia/Seoul")
 UTC = ZoneInfo("UTC")
-USER_AGENT = "Mozilla/5.0 (GameNewsBot/6.0; +https://github.com/)"
+USER_AGENT = "Mozilla/5.0 (GameNewsBot/7.0; +https://github.com/)"
 TIMEOUT = 12
 
 PRIMARY_KEYWORDS = [
+    # 기존 산업/비즈니스
     "신작", "성과", "호재", "악재", "리스크", "정책", "업데이트", "출시",
     "매출", "순위", "소송", "규제", "CBT", "OBT", "인수", "투자", "M&A",
     "서비스 종료", "종료", "공정위", "과태료", "제재", "행정처분",
-    "분쟁", "환불", "확률형", "표시광고", "제재금", "1위", "흥행"
+    "분쟁", "환불", "확률형", "표시광고", "제재금", "1위", "흥행",
+
+    # AI / 최신 기술
+    "AI", "인공지능", "생성형 AI", "AI NPC", "AI 캐릭터", "AI 번역", "AI 음성",
+    "LLM", "대형언어모델", "GPT", "ChatGPT", "자동화", "클라우드",
+    "엔진", "언리얼", "유니티", "그래픽스", "렌더링", "최적화",
+    "멀티플랫폼", "크로스플레이",
+
+    # 게임 산업 운영
+    "사전예약", "런칭", "테스트", "얼리 액세스", "얼리액세스",
+    "글로벌", "글로벌 출시", "퍼블리싱", "퍼블리셔", "신규 IP",
+    "리메이크", "리마스터", "확장팩", "대규모 업데이트", "시즌 업데이트",
+    "라이브 서비스", "서비스 개편",
+
+    # 유저/지표
+    "이용자", "동접", "DAU", "MAU", "트래픽",
+
+    # 주요 기업
+    "넥슨", "넷마블", "엔씨", "NC", "크래프톤", "카카오게임즈",
+    "펄어비스", "네오위즈", "위메이드", "컴투스", "시프트업", "스마일게이트",
+    "웹젠", "네오플",
+
+    # 주요 게임 타이틀
+    "메이플스토리", "메이플", "던전앤파이터", "던파", "FC 온라인", "FC온라인",
+    "서든어택", "마비노기", "카트라이더", "카트라이더 드리프트",
+    "리니지", "리니지M", "리니지W", "리니지2M",
+    "로스트아크", "배틀그라운드", "PUBG", "검은사막", "아이온"
 ]
 
 # Slack 출력 제한
@@ -68,7 +101,16 @@ NON_ARTICLE_TITLE_HINTS = [
     "거래", "나눔", "판매", "삽니다", "버그제보", "건의", "토론",
 ]
 
-NEXON_TERMS = ["넥슨", "nexon", "넥슨코리아", "넥슨게임즈", "네오플", "넥슨네트웍스"]
+NEXON_TERMS = [
+    "넥슨", "nexon",
+    "넥슨코리아", "넥슨게임즈", "넥슨네트웍스", "네오플",
+    "넥슨지티", "넥슨devcat", "민트로켓", "mintrocket",
+    "데이브 더 다이버", "데이브더다이버",
+    "퍼스트 디센던트", "퍼스트디센던트", "the first descendant",
+    "메이플스토리", "메이플", "던전앤파이터", "던파",
+    "마비노기", "서든어택", "카트라이더", "카트라이더 드리프트",
+    "블루 아카이브", "블루아카이브", "바람의나라"
+]
 
 
 # ==========================
@@ -104,10 +146,6 @@ def stable_id(title: str, link: str) -> str:
 def looks_like_non_article(title: str) -> bool:
     t = (title or "").lower()
     return any(h.lower() in t for h in NON_ARTICLE_TITLE_HINTS)
-
-def contains_nexon(title: str, snippet: str) -> bool:
-    blob = f"{title} {snippet}".lower()
-    return any(t.lower() in blob for t in NEXON_TERMS)
 
 def is_business_day(d: date) -> bool:
     if d.weekday() >= 5:
@@ -165,6 +203,48 @@ def log_time(label: str) -> None:
     now_kst = datetime.now(KST)
     now_utc = datetime.now(UTC)
     print(f"[TIME] {label} | KST={now_kst.isoformat()} | UTC={now_utc.isoformat()}")
+
+def extract_meta_description(html: str) -> str:
+    patterns = [
+        r'<meta[^>]+property="og:description"[^>]+content="([^"]+)"',
+        r'<meta[^>]+name="description"[^>]+content="([^"]+)"',
+    ]
+    for pat in patterns:
+        m = re.search(pat, html, re.IGNORECASE)
+        if m:
+            return clean_text(strip_html(m.group(1)))
+    return ""
+
+def score_nexon_relevance(title: str, snippet: str) -> int:
+    title_l = (title or "").lower()
+    snippet_l = (snippet or "").lower()
+
+    score = 0
+
+    strong_terms = ["넥슨", "nexon", "넥슨코리아", "넥슨게임즈", "네오플"]
+    if any(term.lower() in title_l for term in strong_terms):
+        score += 5
+    if any(term.lower() in snippet_l for term in strong_terms):
+        score += 3
+
+    if any(term.lower() in title_l for term in NEXON_TERMS):
+        score += 3
+    if any(term.lower() in snippet_l for term in NEXON_TERMS):
+        score += 2
+
+    issue_terms = [
+        "출시", "신작", "업데이트", "매출", "흥행", "1위", "사전예약",
+        "규제", "소송", "공정위", "과태료", "제재", "서비스 종료"
+    ]
+    if any(term in (title or "") for term in issue_terms):
+        score += 2
+    if any(term in (snippet or "") for term in issue_terms):
+        score += 1
+
+    return score
+
+def contains_nexon(title: str, snippet: str) -> bool:
+    return score_nexon_relevance(title, snippet) >= 3
 
 
 # ==========================
@@ -310,12 +390,23 @@ def fetch_gamemeca_list(start: datetime, end: datetime) -> List[Article]:
         if not in_window(pub, start, end):
             continue
 
+        snippet = ""
+        try:
+            rr = s.get(url, timeout=TIMEOUT)
+            rr.raise_for_status()
+            snippet = extract_meta_description(rr.text)[:180]
+        except Exception:
+            pass
+
         out.append(Article(
             press="게임메카",
             title=title[:140],
             url=url,
             published=pub,
+            snippet=snippet,
         ))
+
+        time.sleep(random.uniform(0.05, 0.12))
     return out
 
 
@@ -358,6 +449,8 @@ def fetch_gameple(start: datetime, end: datetime) -> List[Article]:
         if not title or looks_like_non_article(title):
             continue
 
+        snippet = extract_meta_description(art_html)[:180]
+
         tm = _GAMEPLE_TIME_RE.search(art_html)
         if not tm:
             continue
@@ -375,6 +468,7 @@ def fetch_gameple(start: datetime, end: datetime) -> List[Article]:
             title=title[:140],
             url=url,
             published=pub,
+            snippet=snippet,
         ))
 
         time.sleep(random.uniform(0.05, 0.12))
@@ -423,6 +517,8 @@ def fetch_gametoc(start: datetime, end: datetime) -> List[Article]:
         if not title or looks_like_non_article(title):
             continue
 
+        snippet = extract_meta_description(art_html)[:180]
+
         tm = _GAMETOC_TIME_RE.search(art_html)
         if not tm:
             continue
@@ -440,6 +536,7 @@ def fetch_gametoc(start: datetime, end: datetime) -> List[Article]:
             title=title[:140],
             url=url,
             published=pub,
+            snippet=snippet,
         ))
 
         time.sleep(random.uniform(0.05, 0.12))
@@ -481,7 +578,7 @@ def build_slack_message(general: List[Article], nexon: List[Article], start: dat
         for a in general[:GENERAL_SEND_LIMIT]:
             body += fmt(a)
 
-    body += "\n---\n### 🏢 넥슨 관련 주요 기사 (정확매칭: 제목/요약에 넥슨 포함)\n"
+    body += "\n---\n### 🏢 넥슨 관련 주요 기사 (관련도 기반)\n"
     if not nexon:
         body += "- (없음)\n"
     else:
@@ -575,6 +672,11 @@ def main():
 
     nexon_candidates = [a for a in general if contains_nexon(a.title, a.snippet)]
     nexon = dedup(nexon_candidates)
+    nexon = sorted(
+        nexon,
+        key=lambda a: (score_nexon_relevance(a.title, a.snippet), a.published),
+        reverse=True
+    )
     log_time("filter_end")
 
     print(f"[INFO] stats: {stats}")
@@ -586,7 +688,7 @@ def main():
 
     print("[INFO] preview nexon:")
     for a in nexon[:10]:
-        print(" -", a.title, "::", a.url)
+        print(" -", a.title, f"(score={score_nexon_relevance(a.title, a.snippet)})", "::", a.url)
 
     msgs = build_slack_message(general, nexon, start, end)
 
