@@ -1,20 +1,17 @@
 # ------------------------------------------------------------------
-# [운영용 v7]
+# [운영용 v8]
 # - "진짜 기사"만 + "진짜 원문 링크"만
 # - Google News / googlesearch 완전 제거
 # - 인벤: RSS(FeedBurner) 사용
 # - 게임메카/게임플/게임톡: HTML 리스트에서 기사 URL 수집
 # - 기사 검증: (1) URL 패턴 (도메인별) + (2) 제목 힌트
 # - 기간: 최근 영업일 3일 00:00 ~ 최근 영업일 09:59:59
-# - 디버깅 로그 추가:
-#   * main 시작 시각
-#   * 소스별 fetch 시작/종료 시각
-#   * Slack 전송 시작/종료 시각
-# - 키워드 확장:
-#   * AI / IT / 게임업계 / 주요 타이틀 / 주요 기업
+# - 디버깅 로그 추가
+# - 키워드 확장
 # - 넥슨 관련 기사 분류 개선:
 #   * title + snippet 기반
 #   * 점수 기반 관련도 산정
+#   * 넥슨 회사명/대표 IP 직접 언급이 있어야만 통과
 #   * 관련도 + 최신순 정렬
 #
 # requirements.txt:
@@ -44,7 +41,7 @@ SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL")
 
 KST = ZoneInfo("Asia/Seoul")
 UTC = ZoneInfo("UTC")
-USER_AGENT = "Mozilla/5.0 (GameNewsBot/7.0; +https://github.com/)"
+USER_AGENT = "Mozilla/5.0 (GameNewsBot/8.0; +https://github.com/)"
 TIMEOUT = 12
 
 PRIMARY_KEYWORDS = [
@@ -101,15 +98,33 @@ NON_ARTICLE_TITLE_HINTS = [
     "거래", "나눔", "판매", "삽니다", "버그제보", "건의", "토론",
 ]
 
+# 넥슨 관련 확장 키워드: 너무 넓게 잡지 않도록 보수적으로 구성
 NEXON_TERMS = [
     "넥슨", "nexon",
     "넥슨코리아", "넥슨게임즈", "넥슨네트웍스", "네오플",
-    "넥슨지티", "넥슨devcat", "민트로켓", "mintrocket",
+    "민트로켓", "mintrocket",
     "데이브 더 다이버", "데이브더다이버",
     "퍼스트 디센던트", "퍼스트디센던트", "the first descendant",
+    "메이플스토리", "메이플",
+    "던전앤파이터", "던파",
+    "마비노기", "서든어택",
+    "카트라이더", "카트라이더 드리프트",
+    "블루 아카이브", "블루아카이브",
+    "바람의나라"
+]
+
+# 넥슨 직계/강한 시그널
+NEXON_STRONG_TERMS = [
+    "넥슨", "nexon", "넥슨코리아", "넥슨게임즈", "네오플"
+]
+
+# 넥슨 대표 IP / 브랜드
+NEXON_TITLE_TERMS = [
     "메이플스토리", "메이플", "던전앤파이터", "던파",
     "마비노기", "서든어택", "카트라이더", "카트라이더 드리프트",
-    "블루 아카이브", "블루아카이브", "바람의나라"
+    "블루 아카이브", "블루아카이브", "바람의나라",
+    "퍼스트 디센던트", "퍼스트디센던트",
+    "데이브 더 다이버", "데이브더다이버"
 ]
 
 
@@ -221,10 +236,9 @@ def score_nexon_relevance(title: str, snippet: str) -> int:
 
     score = 0
 
-    strong_terms = ["넥슨", "nexon", "넥슨코리아", "넥슨게임즈", "네오플"]
-    if any(term.lower() in title_l for term in strong_terms):
+    if any(term.lower() in title_l for term in NEXON_STRONG_TERMS):
         score += 5
-    if any(term.lower() in snippet_l for term in strong_terms):
+    if any(term.lower() in snippet_l for term in NEXON_STRONG_TERMS):
         score += 3
 
     if any(term.lower() in title_l for term in NEXON_TERMS):
@@ -244,7 +258,17 @@ def score_nexon_relevance(title: str, snippet: str) -> int:
     return score
 
 def contains_nexon(title: str, snippet: str) -> bool:
-    return score_nexon_relevance(title, snippet) >= 3
+    blob = f"{title} {snippet}".lower()
+
+    has_strong = any(term.lower() in blob for term in NEXON_STRONG_TERMS)
+    has_title = any(term.lower() in blob for term in NEXON_TITLE_TERMS)
+
+    # 넥슨 회사명/자회사명 직접 언급 또는 대표 IP 직접 언급이 있어야 통과
+    if not (has_strong or has_title):
+        return False
+
+    # 점수 기준도 보수적으로 상향
+    return score_nexon_relevance(title, snippet) >= 5
 
 
 # ==========================
