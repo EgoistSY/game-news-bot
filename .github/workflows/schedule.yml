@@ -1,8 +1,8 @@
 name: Daily Game News Scraper
 
-on:
-  schedule:
-    - cron: '17 1 * * 1-5'   # 평일 10:17 KST
+#on:
+#  schedule:
+#    - cron: '17 1 * * 1-5'   # 평일 10:17 KST
   workflow_dispatch:
 
 concurrency:
